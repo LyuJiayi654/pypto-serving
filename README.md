@@ -128,9 +128,9 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
 
 - All model/device/runtime options are passed via CLI arguments. Run
   `pypto-serving --help` for the full list.
-- Parallel serving development notes live in `docs/dev/parallel.md`.
+- Parallel serving development notes live in `docs/user-guide/parallel.md`.
 - DeepSeek V4 checkpoint preparation and NPU serving notes live in
-  `docs/dev/model/deepseek-v4.md`.
+  `docs/models/deepseek-v4.md`.
 - Generated kernel artifacts are written under `build_output/` and are ignored
   by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the
