@@ -43,6 +43,9 @@ class MtpAccuracyCase:
     expected_text: str | None
     enable_prefix_caching: bool = False
 
+CHUNKED_PREFILL_ACCURACY_PROMPTS_PATH = (
+    ROOT / "tests" / "fixtures" / "deepseek_v4_chunked_prefill_accuracy_prompts.json"
+)
 
 # K=1 uses EAGLE look-ahead, so a reusable 128-token prefix needs another
 # complete page after it. Repeating a common single-token fragment keeps the
@@ -433,6 +436,56 @@ def test_deepseek_v4_http_completion_matches_expected_text(
     except BaseException:
         _print_server_log(log_path)
         raise
+
+
+def test_chunked_prefill_accuracy_prompts_match_model_tokenizer() -> None:
+    model_dir_env = os.environ.get("PYPTO_DSV4_MODEL_DIR")
+    model_dir = Path(model_dir_env) if model_dir_env else None
+    if model_dir is None or not model_dir.is_dir():
+        pytest.fail(f"PYPTO_DSV4_MODEL_DIR not set or not a directory: {model_dir}")
+
+    from pypto_serving.model.tokenizer import load_tokenizer
+
+    payload = json.loads(CHUNKED_PREFILL_ACCURACY_PROMPTS_PATH.read_text())
+    assert payload.get("schema_version") == 1
+    cases = payload.get("cases")
+    assert isinstance(cases, list) and len(cases) == 6
+
+    tokenizer = load_tokenizer(model_dir)
+    actual_counts = {
+        case["id"]: len(tokenizer.encode(case["prompt"]))
+        for case in cases
+    }
+    expected_counts = {
+        case["id"]: case["expected_prompt_tokens"]
+        for case in cases
+    }
+    assert actual_counts == expected_counts == {
+        "fibonacci_127": 127,
+        "fibonacci_128": 128,
+        "fibonacci_129": 129,
+        "authorization_code_255": 255,
+        "authorization_code_256": 256,
+        "authorization_code_257": 257,
+    }
+
+    prompt_127, prompt_128, prompt_129, prompt_255, prompt_256, prompt_257 = (
+        case["prompt"] for case in cases
+    )
+    assert prompt_127 == prompt_128.replace("explain briefly whether", "explain whether")
+    assert prompt_129 == prompt_128.replace(
+        "keep the explanation clear.",
+        "keep the explanation very clear.",
+    )
+    assert prompt_256 == prompt_255.replace("answer clearly.", "answer very clearly.")
+    assert prompt_257 == prompt_255.replace("answer clearly.", "answer very very clearly.")
+    assert all(case["required_output_substrings"] == ["89", "144"] for case in cases[:3])
+    assert all(case["required_output_substrings"] == ["CEDAR-4821"] for case in cases[3:])
+    assert [case["max_new_tokens"] for case in cases] == [48] * 6
+    assert all(
+        case["expected_prompt_tokens"] + case["max_new_tokens"] <= 384
+        for case in cases
+    )
 
 
 def test_completion_http_error_includes_response_body(monkeypatch) -> None:

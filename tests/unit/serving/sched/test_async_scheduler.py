@@ -67,6 +67,171 @@ def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
     )
 
 
+def _scheduled_prefill_chunks(
+    prompt_len: int,
+    *,
+    threshold: int = 2048,
+) -> list[tuple[int, int]]:
+    manager = KvCacheManager(num_blocks=64, block_size=128, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=512,
+            long_prefill_token_threshold=threshold,
+            max_prefill_tokens_per_request=128,
+            max_seq_len=512,
+            enable_prefix_cache=False,
+            num_speculative_tokens=1,
+            supports_chunked_prefill_with_speculation=True,
+        ),
+        manager,
+    )
+    request = Request(
+        request_id="chunked",
+        prompt_token_ids=list(range(prompt_len)),
+        max_new_tokens=1,
+        temperature=0.0,
+    )
+    scheduler.add_request(request)
+
+    chunks: list[tuple[int, int]] = []
+    while scheduler.has_work():
+        output = scheduler.schedule()
+        assert len(output.scheduled_requests) == 1
+        scheduled = output.scheduled_requests[0]
+        chunks.append((scheduled.num_computed_tokens, scheduled.num_new_tokens))
+        completes_prompt = (
+            scheduled.num_computed_tokens + scheduled.num_new_tokens >= prompt_len
+        )
+        sampled = {request.request_id: [7]} if completes_prompt else {}
+        scheduler.update_from_output(output, sampled)
+    return chunks
+
+
+@pytest.mark.parametrize(
+    ("prompt_len", "expected"),
+    [
+        (127, [(0, 127)]),
+        (128, [(0, 128)]),
+        (129, [(0, 128), (128, 1)]),
+        (255, [(0, 128), (128, 127)]),
+        (256, [(0, 128), (128, 128)]),
+        (257, [(0, 128), (128, 128), (256, 1)]),
+    ],
+)
+def test_scheduler_honors_model_prefill_token_limit(prompt_len, expected):
+    assert _scheduled_prefill_chunks(prompt_len) == expected
+
+
+def test_scheduler_user_prefill_threshold_can_be_stricter_than_model_limit():
+    assert _scheduled_prefill_chunks(129, threshold=64) == [
+        (0, 64),
+        (64, 64),
+        (128, 1),
+    ]
+
+
+def test_scheduler_without_model_prefill_limit_preserves_large_prefill():
+    manager = KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=512,
+            long_prefill_token_threshold=2048,
+            max_seq_len=512,
+            enable_prefix_cache=False,
+        ),
+        manager,
+    )
+    request = Request("unrestricted", list(range(129)), max_new_tokens=1)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert [item.num_new_tokens for item in output.scheduled_requests] == [129]
+
+
+@pytest.mark.parametrize("prompt_len", [129, 257, 8192])
+def test_scheduler_dynamic_main_prefill_is_not_forced_to_mtp_tile(prompt_len):
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=8192,
+            long_prefill_token_threshold=8192,
+            max_prefill_tokens_per_request=8192,
+            max_seq_len=8193,
+            enable_prefix_cache=False,
+            num_speculative_tokens=0,
+        ),
+        KvCacheManager(num_blocks=128, block_size=128, enable_prefix_cache=False),
+    )
+    scheduler.add_request(
+        Request("dynamic-main", list(range(prompt_len)), max_new_tokens=1)
+    )
+
+    output = scheduler.schedule()
+
+    assert [item.num_new_tokens for item in output.scheduled_requests] == [prompt_len]
+
+
+def test_scheduler_rejects_model_limit_when_chunked_prefill_is_disabled():
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_prefill_tokens_per_request=128,
+            max_seq_len=512,
+            enable_prefix_cache=False,
+            enable_chunk_prefill=False,
+        ),
+        KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False),
+    )
+
+    with pytest.raises(ValueError, match="single-dispatch prefill limit 128"):
+        scheduler.add_request(Request("too-long", list(range(129)), max_new_tokens=1))
+
+
+def test_scheduler_rejects_multi_chunk_prefill_when_speculation_is_unsupported():
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=512,
+            max_prefill_tokens_per_request=128,
+            max_seq_len=512,
+            enable_prefix_cache=False,
+            num_speculative_tokens=1,
+            supports_chunked_prefill_with_speculation=False,
+        ),
+        KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False),
+    )
+
+    with pytest.raises(ValueError, match="not supported with speculative decoding"):
+        scheduler.add_request(Request("mtp-long", list(range(129)), max_new_tokens=1))
+
+
+def test_scheduler_defers_single_dispatch_prefill_on_residual_budget():
+    manager = KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False)
+    scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=128,
+            max_prefill_tokens_per_request=128,
+            max_seq_len=256,
+            enable_prefix_cache=False,
+            num_speculative_tokens=1,
+            supports_chunked_prefill_with_speculation=False,
+        ),
+        manager,
+    )
+    first = Request("first", list(range(80)), max_new_tokens=1, temperature=0.0)
+    second = Request("second", list(range(80)), max_new_tokens=1, temperature=0.0)
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+
+    first_output = scheduler.schedule()
+
+    assert [item.request.request_id for item in first_output.scheduled_requests] == ["first"]
+    assert first_output.scheduled_requests[0].num_new_tokens == 80
+    assert [request.request_id for request in scheduler.waiting] == ["second"]
+
+    scheduler.update_from_output(first_output, {"first": [7]})
+    second_output = scheduler.schedule()
+    assert [item.request.request_id for item in second_output.scheduled_requests] == ["second"]
+
+
 def test_async_reconciliation_matches_sync_end_state():
     """Driving N decode steps through the async path (schedule -> advance ->
     update_from_output) yields the same request state as the sync path."""

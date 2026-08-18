@@ -26,10 +26,11 @@ import pypto_serving.cli.main as cli
 from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
 from pypto_serving.model import model_loader
 from pypto_serving.model import tokenizer as tokenizer_module
-from pypto_serving.model.deepseek import npu_executor, weight_loader
+from pypto_serving.model.deepseek import npu_executor, npu_runner, weight_loader
 from pypto_serving.model.deepseek import task_args as task_args_module
 from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+    DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
     DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS,
     DeepSeekV4CacheLayout,
     DeepSeekV4CacheMetadataBuilder,
@@ -629,6 +630,8 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.enable_prefix_cache is False
     assert config.executor_kwargs["num_speculative_tokens"] == 4
     assert config.runtime_config.num_speculative_tokens == 4
+    assert config.runtime_config.max_prefill_tokens_per_request == 128
+    assert config.runtime_config.supports_chunked_prefill_with_speculation is True
     assert config.max_num_running_reqs == 16
     assert config.executor_kwargs["use_compile_cache"] is True
 
@@ -667,6 +670,10 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
     config = cli.build_serving_engine_config(args)
 
     assert config.executor_kwargs["num_speculative_tokens"] == 0
+    assert (
+        config.runtime_config.max_prefill_tokens_per_request
+        == DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
+    )
 
 
 @pytest.mark.parametrize(
@@ -1699,6 +1706,7 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.request_ids == ("req-a",)
     assert prepared.ranks == (0,)
     assert prepared.actual_tokens == (3,)
+    assert prepared.kernel_tokens == 128
     assert prepared.x_hc.shape == (8, 128, 4, 4)
     assert prepared.x_hc.dtype == torch.float32
     assert prepared.ori_block_table.shape == (8, 128)
@@ -1743,6 +1751,148 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     ]
     assert prepared.num_tokens_per_owner.tolist() == [3, 0, 0, 0, 0, 0, 0, 0]
     assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
+
+
+@pytest.mark.parametrize(
+    ("actual_tokens", "kernel_tokens"),
+    [(129, 256), (257, 384), (8192, 8192)],
+)
+def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
+    actual_tokens,
+    kernel_tokens,
+):
+    runner, model = _runner_for_prepared_inputs()
+    model = replace(
+        model,
+        runtime=replace(
+            model.runtime,
+            max_seq_len=8193,
+            max_num_batched_tokens=8192,
+            max_prefill_tokens_per_request=DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
+        ),
+    )
+    embeddings = torch.arange(actual_tokens * 4, dtype=torch.float32).reshape(
+        actual_tokens,
+        4,
+    ).to(torch.bfloat16)
+
+    prepared = runner.prepare_prefill_inputs(
+        model,
+        PrefillBatch(
+            request_ids=["req-dynamic"],
+            token_ids=torch.arange(actual_tokens, dtype=torch.long),
+            input_embeddings=embeddings,
+            seq_lens=[actual_tokens],
+            chunk_lens=[actual_tokens],
+            chunk_offsets=[0],
+            chunk_starts=[0],
+            block_ids_by_group=_grouped_cache_rows(1),
+            cache_partitions=[0],
+        ),
+    )
+
+    assert prepared.actual_tokens == (actual_tokens,)
+    assert prepared.kernel_tokens == kernel_tokens
+    assert prepared.x_hc.shape == (8, kernel_tokens, 4, 4)
+    for tensor in (
+        prepared.input_ids,
+        prepared.position_ids,
+        prepared.ori_slot_mapping,
+        prepared.hca_cmp_slot_mapping,
+        prepared.hca_state_slot_mapping,
+        prepared.csa_cmp_slot_mapping,
+        prepared.csa_idx_slot_mapping,
+        prepared.csa_state_slot_mapping,
+        prepared.csa_inner_state_slot_mapping,
+    ):
+        assert tensor.shape == (8, kernel_tokens)
+    assert prepared.logit_row_indices[0, 0].item() == actual_tokens - 1
+    if actual_tokens < kernel_tokens:
+        assert torch.all(prepared.ori_slot_mapping[0, actual_tokens:] == -1)
+
+
+def test_deepseek_prepare_prefill_inputs_pads_mixed_ranks_to_one_dynamic_extent():
+    runner, model = _runner_for_prepared_inputs()
+    model = replace(
+        model,
+        runtime=replace(
+            model.runtime,
+            max_seq_len=1024,
+            max_num_batched_tokens=512,
+            max_prefill_tokens_per_request=DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
+        ),
+    )
+    chunk_lens = [129, 257]
+    total_tokens = sum(chunk_lens)
+
+    prepared = runner.prepare_prefill_inputs(
+        model,
+        PrefillBatch(
+            request_ids=["req-short", "req-long"],
+            token_ids=torch.arange(total_tokens, dtype=torch.long),
+            input_embeddings=torch.arange(total_tokens * 4, dtype=torch.float32)
+            .reshape(total_tokens, 4)
+            .to(torch.bfloat16),
+            seq_lens=chunk_lens,
+            chunk_lens=chunk_lens,
+            chunk_offsets=[0, chunk_lens[0]],
+            chunk_starts=[0, 0],
+            block_ids_by_group=_grouped_cache_rows(2),
+            cache_partitions=[1, 6],
+        ),
+    )
+
+    assert prepared.actual_tokens == (129, 257)
+    assert prepared.kernel_tokens == 384
+    assert prepared.x_hc.shape == (8, 384, 4, 4)
+    assert prepared.num_tokens_per_owner.tolist() == [0, 129, 0, 0, 0, 0, 257, 0]
+    assert prepared.logit_row_indices[1, 0].item() == 128
+    assert prepared.logit_row_indices[6, 0].item() == 256
+    assert torch.all(prepared.ori_slot_mapping[1, 129:] == -1)
+    assert torch.all(prepared.ori_slot_mapping[6, 257:] == -1)
+
+
+def test_deepseek_mtp_prefill_keeps_one_tile_main_dispatch_limit():
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.num_speculative_tokens = 1
+
+    with pytest.raises(ValueError, match="MTP prefill received 129.*limit is 128"):
+        runner._prefill_kernel_tokens(129, runtime=model.runtime)
+
+
+def test_deepseek_prepare_prefill_inputs_clamps_inactive_tail_positions():
+    runner, model = _runner_for_prepared_inputs()
+    embeddings = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+
+    prepared = runner.prepare_prefill_inputs(
+        model,
+        PrefillBatch(
+            request_ids=["req-tail"],
+            token_ids=torch.tensor([10, 11], dtype=torch.long),
+            input_embeddings=embeddings,
+            seq_lens=[260],
+            chunk_lens=[2],
+            chunk_offsets=[0],
+            chunk_starts=[258],
+            block_ids_by_group=_grouped_cache_rows(1),
+            cache_partitions=[0],
+        ),
+    )
+
+    assert prepared.actual_tokens == (2,)
+    assert prepared.position_ids[0, :4].tolist() == [258, 259, 259, 259]
+    assert torch.all(prepared.position_ids[0] < model.runtime.max_seq_len)
+    assert torch.all(prepared.ori_slot_mapping[0, :2] >= 0)
+    assert prepared.ori_slot_mapping[0, 2:].tolist() == [-1] * 126
+
+
+def test_deepseek_prefill_kernel_positions_reject_more_than_kernel_capacity():
+    with pytest.raises(ValueError, match="kernel_tokens must cover all active positions"):
+        DeepSeekV4ModelRunner._prefill_kernel_positions(
+            list(range(129)),
+            kernel_tokens=128,
+            max_seq_len=512,
+        )
 
 
 def test_deepseek_prepare_decode_inputs_accepts_device_embedding_batch():
@@ -1956,7 +2106,7 @@ def test_deepseek_prefill_context_preserves_prepare_reserved_state(monkeypatch):
     slot = state.tail_slot_id
     generation = state.generation
     layout = runner._compiled.layout
-    tokens = 2
+    tokens = 1
     hidden = 4
     inputs = SimpleNamespace(
         request_ids=("req-a",),
@@ -1979,6 +2129,84 @@ def test_deepseek_prefill_context_preserves_prepare_reserved_state(monkeypatch):
     assert state.tail_slot_id == slot
     assert state.generation == generation
     assert state.prefill_context is not None
+
+
+def test_deepseek_mtp_prefill_advances_one_row_behind_chunked_main_prefill():
+    layout = DeepSeekV4CacheLayout(
+        ranks=2,
+        prefill_seq=4,
+        prefill_ori_max_blocks=4,
+        decode_batch=1,
+        decode_seq=2,
+        decode_tokens=2,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
+    task_args = mtp_prefill_task_args(runner, hidden=1)
+    task_args.allocate_host_shared(None)
+    runner._mtp_prefill_task_args = task_args
+    dispatch_counts = []
+    runner._run_mtp_prefill = dispatch_counts.append
+
+    def make_inputs(start: int, token_count: int, *, embedding_base: int, hidden_base: int):
+        x_hc = torch.zeros((2, 4, 4, 1), dtype=torch.float32)
+        pre_hc = torch.zeros((2, 4, 4, 1), dtype=torch.float32)
+        input_ids = torch.zeros((2, 4), dtype=torch.long)
+        position_ids = torch.zeros((2, 4), dtype=torch.int32)
+        slot_mapping = torch.full((2, 4), -1, dtype=torch.long)
+        block_table = torch.zeros((2, 4), dtype=torch.int32)
+        x_hc[0, :token_count, 0, 0] = torch.arange(
+            embedding_base, embedding_base + token_count, dtype=torch.float32
+        )
+        pre_hc[0, :token_count, 0, 0] = torch.arange(
+            hidden_base, hidden_base + token_count, dtype=torch.float32
+        )
+        input_ids[0, :token_count] = torch.arange(embedding_base, embedding_base + token_count)
+        position_ids[0, :token_count] = torch.arange(start, start + token_count)
+        slot_mapping[0, :token_count] = torch.arange(start, start + token_count)
+        block_table[0] = torch.arange(10 + start, 14 + start)
+        return SimpleNamespace(
+            request_ids=("req-a",),
+            ranks=(0,),
+            actual_tokens=(token_count,),
+            x_hc=x_hc,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            ori_block_table=block_table,
+            ori_slot_mapping=slot_mapping,
+        ), pre_hc
+
+    first, first_pre_hc = make_inputs(0, 4, embedding_base=10, hidden_base=100)
+    runner._capture_mtp_prefill_context(first, first_pre_hc)
+    assert dispatch_counts == [3]
+    assert task_args.tensors["input_ids"][0, :3].tolist() == [11, 12, 13]
+    assert task_args.tensors["position_ids"][0, :3].tolist() == [0, 1, 2]
+    assert task_args.tensors["prev_hidden_states"][0, :3, 0, 0].tolist() == [
+        100.0,
+        101.0,
+        102.0,
+    ]
+    assert runner._mtp_request_states["req-a"].prefill_context.position_id == 3
+
+    second, second_pre_hc = make_inputs(4, 2, embedding_base=20, hidden_base=200)
+    runner._capture_mtp_prefill_context(second, second_pre_hc)
+    assert dispatch_counts == [3, 2]
+    assert task_args.tensors["input_ids"][0, :2].tolist() == [20, 21]
+    assert task_args.tensors["position_ids"][0, :2].tolist() == [3, 4]
+    assert task_args.tensors["prev_hidden_states"][0, :2, 0, 0].tolist() == [
+        103.0,
+        200.0,
+    ]
+    assert runner._mtp_request_states["req-a"].prefill_context.position_id == 5
 
 
 def test_deepseek_run_decode_dispatches_active_token_count():
@@ -2216,6 +2444,46 @@ def test_deepseek_prepared_mtp_decode_skips_redundant_dynamic_input_staging():
     assert state.committed_count == 2
 
 
+def test_deepseek_sync_mtp_decode_uses_general_prepare_fallback():
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.num_speculative_tokens = 1
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[3]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([128], dtype=torch.int32),
+        cache_partitions=[0],
+        allow_device_greedy_sampling=True,
+    )
+    placeholder_batch = replace(batch, token_ids=torch.tensor([[0]], dtype=torch.long))
+    prepared = SimpleNamespace(
+        mtp_tail_slot_ids=torch.zeros(1, dtype=torch.int32),
+        dispatch_args=("bound",),
+        per_rank_counts=(1,),
+    )
+    pending = object()
+    calls = []
+
+    runner._device_state_placeholder_batch = lambda value: (
+        calls.append(("placeholder", value)) or placeholder_batch
+    )
+    runner.prepare_decode = lambda runtime_model, value, *, buffer_slot: (
+        calls.append(("prepare", runtime_model, value, buffer_slot)) or prepared
+    )
+    runner.dispatch_prepared_decode = lambda runtime_model, value, inputs: (
+        calls.append(("dispatch", runtime_model, value, inputs)) or pending
+    )
+
+    result = runner._dispatch_mtp_decode(model, batch)
+
+    assert result is pending
+    assert calls == [
+        ("placeholder", batch),
+        ("prepare", model, placeholder_batch, 0),
+        ("dispatch", model, batch, prepared),
+    ]
+
+
 def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
     layout = DeepSeekV4CacheLayout(
         ranks=1,
@@ -2269,6 +2537,118 @@ def test_deepseek_prefill_staging_keeps_worker_resident_cache_tensors_out():
         "csa_inner_compress_state",
     ):
         assert name not in prefill.tensors
+
+
+def test_deepseek_dynamic_prefill_views_reuse_pre_fork_shared_storage():
+    model = _runtime_model_for_embeddings()
+    model = replace(
+        model,
+        runtime=replace(
+            model.runtime,
+            max_num_batched_tokens=10,
+            max_prefill_tokens_per_request=DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
+        ),
+    )
+    layout = DeepSeekV4CacheLayout(
+        ranks=2,
+        hc_mult=1,
+        prefill_seq=4,
+        decode_batch=1,
+        decode_seq=1,
+        decode_tokens=1,
+        block_size=1,
+        prefill_ori_max_blocks=1,
+        decode_ori_max_blocks=1,
+        ori_table_max_blocks=1,
+        cmp_max_blocks=1,
+        idx_max_blocks=1,
+        hca_state_max_blocks=1,
+        csa_state_max_blocks=1,
+        csa_inner_state_max_blocks=1,
+        c128_state_block_size=1,
+        c4_state_block_size=1,
+        prefill_cmp_max_blocks=1,
+        prefill_idx_max_blocks=1,
+        prefill_hca_state_max_blocks=1,
+        prefill_csa_state_max_blocks=1,
+        prefill_csa_inner_state_max_blocks=1,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            runtime_model=model,
+            freqs_cos=torch.zeros((2, 1, 1), dtype=torch.bfloat16),
+            freqs_sin=torch.zeros((2, 1, 1), dtype=torch.bfloat16),
+        )
+    )
+    task_args = prefill_task_args(runner, hidden=1, vocab=1)
+    task_args.allocate_host_shared(None)
+    runner._prefill_task_args = task_args
+    assert task_args.tensors["x_hc"].shape == (2, 12, 1, 1)
+
+    task_args.tensors["hidden_out"].fill_(7)
+    task_args.tensors["pre_hc_hidden_out"].fill_(7)
+    task_args.tensors["logits"].fill_(7)
+    task_args.clear_outputs()
+    assert task_args.tensors["hidden_out"].eq(7).all()
+    assert task_args.tensors["pre_hc_hidden_out"].eq(0).all()
+    assert task_args.tensors["logits"].eq(0).all()
+
+    kernel_tokens = 8
+    metadata = {}
+    for name, target in task_args.tensors.items():
+        if name == "x_hc":
+            continue
+        shape = tuple(target.shape)
+        if name in npu_runner._PREFILL_FWD_DYNAMIC_TENSOR_NAMES:
+            shape = (layout.ranks, kernel_tokens, *shape[2:])
+        metadata[name] = torch.full(shape, 7, dtype=target.dtype)
+    inputs = SimpleNamespace(
+        kernel_tokens=kernel_tokens,
+        x_hc=torch.full((2, kernel_tokens, 1, 1), 3.0, dtype=torch.float32),
+        **metadata,
+    )
+
+    runner._stage_prefill_fwd_inputs(inputs)
+
+    x_hc_view = runner._prefill_token_view(task_args.tensors["x_hc"], kernel_tokens)
+    assert x_hc_view.is_shared()
+    assert x_hc_view.is_contiguous()
+    assert x_hc_view.data_ptr() == task_args.tensors["x_hc"].data_ptr()
+    assert torch.equal(x_hc_view, inputs.x_hc)
+    for name in npu_runner._PREFILL_FWD_DYNAMIC_TENSOR_NAMES:
+        staged = runner._prefill_token_view(task_args.tensors[name], kernel_tokens)
+        assert staged.is_shared()
+        assert staged.is_contiguous()
+        assert torch.equal(staged, metadata[name])
+
+    hidden_storage = task_args.tensors["hidden_out"]
+    hidden_view = runner._prefill_token_view(hidden_storage, kernel_tokens)
+    assert hidden_storage.shape == (2, 12, 1)
+    assert hidden_view.shape == (2, 8, 1)
+    assert hidden_view.is_shared()
+    assert hidden_view.is_contiguous()
+
+    shared_scalar = torch.zeros(1).share_memory_()
+    task_args.build = lambda: tuple(
+        task_args.tensors.get(name, shared_scalar) for name in task_args.names
+    )
+    dispatch_values = dict(
+        zip(task_args.names, runner._prefill_fwd_args(kernel_tokens), strict=True)
+    )
+
+    assert dispatch_values["x_hc"].shape == (2, 8, 1, 1)
+    assert dispatch_values["hidden_out"].shape == (2, 8, 1)
+    for name in npu_runner._PREFILL_FWD_DYNAMIC_TENSOR_NAMES:
+        assert dispatch_values[name].shape == (2, 8)
+        assert dispatch_values[name].is_shared()
+        assert dispatch_values[name].is_contiguous()
 
 
 def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
@@ -2369,7 +2749,7 @@ def test_deepseek_mtp_prefill_outputs_allocate_empty_rank_shards_once():
     assert [worker_id for _shape, _dtype, _init, worker_id in worker.allocations] == [0, 1] * 3
 
 
-def test_deepseek_mtp_prefill_reads_only_owner_logits_row():
+def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
     layout = DeepSeekV4CacheLayout(
         ranks=2,
         prefill_seq=1,
@@ -2417,6 +2797,10 @@ def test_deepseek_mtp_prefill_reads_only_owner_logits_row():
             (layout.ranks, 8, 129280),
             dtype=torch.float32,
         ).share_memory_(),
+        prefill_pre_hc_mirror=torch.empty(
+            (layout.ranks, layout.prefill_seq, 4, 5),
+            dtype=torch.float32,
+        ).share_memory_(),
     )
     from pypto_serving.model.deepseek.task_args import mtp_prefill_task_args
 
@@ -2426,15 +2810,23 @@ def test_deepseek_mtp_prefill_reads_only_owner_logits_row():
     runner._mtp_prefill_task_args = ta
 
     host_row = runner._read_mtp_prefill_logits(owner_rank=1)
+    host_pre_hc = runner._read_mtp_prefill_pre_hc(owner_rank=1, row=0)
 
     assert host_row.data_ptr() == runner._mtp_buffers.prefill_logits[1, 0].data_ptr()
+    assert host_pre_hc.shape == (4, 5)
     assert worker.copies == [
         (
             host_row.data_ptr(),
             ta.tensors["logits"].shards[1].data_ptr,
             129280 * torch.float32.itemsize,
             1,
-        )
+        ),
+        (
+            runner._mtp_buffers.prefill_pre_hc_mirror[1, 0].data_ptr(),
+            ta.tensors["pre_hc_hidden_out"].shards[1].data_ptr,
+            4 * 5 * torch.float32.itemsize,
+            1,
+        ),
     ]
 
 
@@ -2497,6 +2889,7 @@ def test_deepseek_mtp_prefill_args_use_device_outputs():
     assert args[names.index("hidden_out")] is ta.tensors["hidden_out"]
     assert args[names.index("pre_hc_hidden_out")] is ta.tensors["pre_hc_hidden_out"]
     assert args[names.index("logits")] is ta.tensors["logits"]
+    assert "num_tokens_per_owner" not in names
 
 
 def test_deepseek_release_finished_requests_discards_mtp_state():
@@ -2980,6 +3373,9 @@ class _TaskArgsStubRunner:
 
     def _require_stacked_weights(self):
         return SimpleNamespace(tensors=self._stacked)
+
+    def _prefill_buffer_tokens(self):
+        return self._compiled.layout.prefill_seq
 
     def _device_cache_values(self):
         return self._cache

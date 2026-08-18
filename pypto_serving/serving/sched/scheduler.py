@@ -44,11 +44,13 @@ class SchedulerConfig:
     max_num_running_reqs: int = 32
     max_num_scheduled_tokens: int = 4096
     long_prefill_token_threshold: int = 2048
+    max_prefill_tokens_per_request: int | None = None
     max_seq_len: int = 4096
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
+    supports_chunked_prefill_with_speculation: bool = True
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
     async_scheduling: bool = False
@@ -61,6 +63,11 @@ class SchedulerConfig:
                 "max_num_scheduled_tokens must fit one decode token plus "
                 "num_speculative_tokens"
             )
+        if (
+            self.max_prefill_tokens_per_request is not None
+            and self.max_prefill_tokens_per_request <= 0
+        ):
+            raise ValueError("max_prefill_tokens_per_request must be positive when specified")
 
 
 @dataclass
@@ -201,6 +208,26 @@ class Scheduler:
                 max_seq_len, prompt_len,
             )
             request.max_new_tokens = remaining
+        model_prefill_limit = self.config.max_prefill_tokens_per_request
+        if (
+            not self.config.enable_chunk_prefill
+            and model_prefill_limit is not None
+            and prompt_len > model_prefill_limit
+        ):
+            raise ValueError(
+                f"Request {request.request_id} prompt length {prompt_len} exceeds the model's "
+                f"single-dispatch prefill limit {model_prefill_limit}, but chunked prefill "
+                "is disabled."
+            )
+        if self._requires_single_prefill_dispatch():
+            single_dispatch_limit = self._single_prefill_dispatch_limit()
+            if prompt_len > single_dispatch_limit:
+                raise ValueError(
+                    f"Request {request.request_id} prompt length {prompt_len} requires chunked "
+                    "prefill, which is not supported with speculative decoding for this model; "
+                    f"the single-dispatch limit is {single_dispatch_limit}. Disable speculative "
+                    "decoding or shorten the prompt."
+                )
         if self.config.enable_prefix_cache:
             if self.kv_cache_manager.has_groups:
                 request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
@@ -262,9 +289,7 @@ class Scheduler:
                 running_to_keep.append(request)
                 continue
 
-            if self.config.enable_chunk_prefill and self.config.long_prefill_token_threshold > 0:
-                num_new = min(num_new, self.config.long_prefill_token_threshold)
-            num_new = min(num_new, token_budget)
+            num_new = self._limit_scheduled_tokens(request, num_new, token_budget)
 
             if num_new <= 0:
                 running_to_keep.append(request)
@@ -386,9 +411,7 @@ class Scheduler:
             )
 
             num_new = request.num_new_tokens_needed
-            if self.config.enable_chunk_prefill and self.config.long_prefill_token_threshold > 0:
-                num_new = min(num_new, self.config.long_prefill_token_threshold)
-            num_new = min(num_new, token_budget)
+            num_new = self._limit_scheduled_tokens(request, num_new, token_budget)
 
             if num_new <= 0:
                 # Full prefix-cache hit: leave 1 token for prefill so the
@@ -469,6 +492,46 @@ class Scheduler:
         self.waiting = remaining_waiting
 
         return output
+
+    def _prefill_chunk_limit(self) -> int | None:
+        """Return the configured per-request prefill limit before step budget."""
+        limits: list[int] = []
+        if self.config.max_prefill_tokens_per_request is not None:
+            limits.append(self.config.max_prefill_tokens_per_request)
+        if self.config.enable_chunk_prefill and self.config.long_prefill_token_threshold > 0:
+            limits.append(self.config.long_prefill_token_threshold)
+        return min(limits) if limits else None
+
+    def _single_prefill_dispatch_limit(self) -> int:
+        """Return the largest prompt that can be guaranteed to run in one step."""
+        limit = self._prefill_chunk_limit()
+        if limit is None:
+            return self.config.max_num_scheduled_tokens
+        return min(limit, self.config.max_num_scheduled_tokens)
+
+    def _requires_single_prefill_dispatch(self) -> bool:
+        """Return whether speculative state cannot span multiple prefill steps."""
+        return (
+            self.config.num_speculative_tokens > 0
+            and not self.config.supports_chunked_prefill_with_speculation
+        )
+
+    def _limit_scheduled_tokens(
+        self,
+        request: Request,
+        num_new: int,
+        token_budget: int,
+    ) -> int:
+        """Apply per-request prefill limits and the remaining step budget."""
+        if request.is_prefill:
+            chunk_limit = self._prefill_chunk_limit()
+            if chunk_limit is not None:
+                num_new = min(num_new, chunk_limit)
+            num_new = min(num_new, token_budget)
+            if self._requires_single_prefill_dispatch() and num_new < request.num_new_tokens_needed:
+                return 0
+            return num_new
+        return min(num_new, token_budget)
 
     def _grouped_cache_phase(self) -> str | None:
         """Choose one execution phase when grouped caches share decode scratch space."""

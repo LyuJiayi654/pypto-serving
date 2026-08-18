@@ -343,11 +343,17 @@ def _static_weight_source(runner: DeepSeekV4ModelRunner, name: str):
 
 
 def _prefill_slot_specs(
-    layout, hidden: int, vocab: int
+    layout,
+    hidden: int,
+    vocab: int,
+    *,
+    token_capacity: int | None = None,
 ) -> dict[str, tuple[torch.dtype, tuple[int, ...], ClearPolicy]]:
     """Host-shared slot name -> (dtype, full shape, clear policy) for the packed prefill dispatch."""
     ranks = layout.ranks
-    seq = layout.prefill_seq
+    seq = layout.prefill_seq if token_capacity is None else int(token_capacity)
+    if seq <= 0:
+        raise ValueError("DeepSeekV4 prefill token capacity must be positive")
     hc_mult = layout.hc_mult
     zero = ClearPolicy.ZERO
     return {
@@ -382,9 +388,20 @@ def _prefill_slot_specs(
         "csa_inner_state_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
         "num_tokens_per_owner": (torch.int32, (ranks,), ClearPolicy.NONE),
         "logit_row_indices": (torch.int32, (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS), ClearPolicy.NONE),
-        # outputs (zeroed before each prefill dispatch)
-        "pre_hc_hidden_out": (torch.float32, (ranks, seq, hc_mult, hidden), zero),
-        "hidden_out": (torch.bfloat16, (ranks, seq, hidden), zero),
+        # Outputs read back by the host are zeroed before each dispatch. The
+        # kernel overwrites the active hidden_out extent, so clearing its full
+        # max-sequence backing would add a large, unnecessary host memset.
+        # The main kernel exposes only the final 128-token tile's pre-HC rows.
+        "pre_hc_hidden_out": (
+            torch.float32,
+            (ranks, layout.prefill_seq, hc_mult, hidden),
+            zero,
+        ),
+        "hidden_out": (
+            torch.bfloat16,
+            (ranks, seq, hidden),
+            ClearPolicy.NONE,
+        ),
         "logits": (torch.float32, (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, vocab), zero),
     }
 
@@ -399,7 +416,12 @@ def prefill_task_args(runner: DeepSeekV4ModelRunner, hidden: int, vocab: int) ->
     ``build()`` time (post-fork, post-resident-upload).
     """
     layout = runner._compiled.layout
-    slot_specs = _prefill_slot_specs(layout, hidden, vocab)
+    slot_specs = _prefill_slot_specs(
+        layout,
+        hidden,
+        vocab,
+        token_capacity=runner._prefill_buffer_tokens(),
+    )
     static_weights = set(_PREFILL_STATIC_WEIGHTS)
     cache_pools = set(_PREFILL_CACHE_POOLS)
 

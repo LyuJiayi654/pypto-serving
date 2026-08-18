@@ -189,10 +189,14 @@ class ReplicaEngineCore:
             max_num_running_reqs=self.config.max_num_running_reqs,
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
+            max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
             num_speculative_tokens=runtime.num_speculative_tokens,
+            supports_chunked_prefill_with_speculation=(
+                runtime.supports_chunked_prefill_with_speculation
+            ),
             async_scheduling=self._async_scheduling,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)

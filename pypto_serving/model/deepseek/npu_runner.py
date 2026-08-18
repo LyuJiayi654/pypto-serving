@@ -62,6 +62,9 @@ DEEPSEEK_V4_DECODE_SEQ = 2
 DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
 DEEPSEEK_V4_MTP_DECODE_TOKENS = 16
 DEEPSEEK_V4_PREFILL_BATCH = 1
+# The main prefill wrapper added by pypto-lib #893 accepts a dynamic request
+# extent and walks it in fixed 128-token tiles. The standalone MTP prefill
+# wrapper still accepts exactly one tile.
 DEEPSEEK_V4_PREFILL_SEQ = 128
 # Async serving pipelines at most two device steps. Rolling caches must retain
 # the history needed by the next token plus every token that can be in flight;
@@ -70,6 +73,7 @@ DEEPSEEK_V4_PREFILL_SEQ = 128
 # used by vLLM's SlidingWindowSpec.
 DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS = 2 * DEEPSEEK_V4_PREFILL_SEQ
 DEEPSEEK_V4_MAX_SEQ_LEN = 16384
+DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS = 8192
 # Prefill and decode share scheduler-owned rank-local physical pools. Group
 # block IDs are local to each DP rank and address worker-resident cache shards.
 DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS = 128
@@ -334,6 +338,274 @@ def deepseek_v4_cache_blocks_for_slots(
         for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
     }
 
+
+def deepseek_v4_physical_cache_blocks(
+    group_specs: Sequence[KVCacheGroupSpec],
+    capacity_slots: int,
+    *,
+    scratch_blocks: int,
+) -> dict[str, int]:
+    """Return physical blocks per rank, including isolated padding pages."""
+    if scratch_blocks <= 0:
+        raise ValueError("DeepSeekV4 scratch_blocks must be positive")
+    return {
+        name: num_blocks + int(scratch_blocks)
+        for name, num_blocks in deepseek_v4_cache_blocks_for_slots(
+            group_specs,
+            capacity_slots,
+        ).items()
+    }
+
+
+# Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
+# mirrors pypto-lib prefill_fwd.py ``l3_prefill_fwd`` host signature: every
+# layer-stacked weight/state tensor in core-parameter order, followed by the
+# ``hc_head`` collapse weights, final RMSNorm input, device LM-head weights, and
+# hidden/logit outputs and owner-major execution metadata.
+# The cache pools are ``pl.InOut`` tensors shared by prefill and decode; mutable
+# block tables, slot mappings and token metadata remain shared host inputs.
+_PREFILL_FWD_TENSOR_ORDER = (
+    "x_hc",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_attn_base",
+    "attn_norm_w",
+    "wq_a",
+    "wq_b",
+    "wq_b_scale",
+    "wkv",
+    "gamma_cq",
+    "gamma_ckv",
+    "kv_cache",
+    "attn_sink",
+    "wo_a",
+    "wo_b",
+    "wo_b_scale",
+    "cmp_kv",
+    "hca_cmp_wkv",
+    "hca_cmp_wgate",
+    "hca_cmp_ape",
+    "hca_cmp_norm_w",
+    "hca_compress_state",
+    "csa_cmp_wkv",
+    "csa_cmp_wgate",
+    "csa_cmp_ape",
+    "csa_cmp_norm_w",
+    "csa_compress_state",
+    "csa_hadamard_idx",
+    "csa_idx_wq_b",
+    "csa_idx_wq_b_scale",
+    "csa_weights_proj",
+    "csa_inner_wkv",
+    "csa_inner_wgate",
+    "csa_inner_ape",
+    "csa_inner_norm_w",
+    "csa_inner_compress_state",
+    "idx_kv_cache",
+    "idx_kv_scale",
+    "hca_compress_state_block_table",
+    "csa_compress_state_block_table",
+    "csa_inner_compress_state_block_table",
+    "freqs_cos",
+    "freqs_sin",
+    "ori_block_table",
+    "cmp_block_table",
+    "idx_block_table",
+    "ori_slot_mapping",
+    "position_ids",
+    "input_ids",
+    "hca_cmp_slot_mapping",
+    "hca_state_slot_mapping",
+    "csa_cmp_slot_mapping",
+    "csa_idx_slot_mapping",
+    "csa_state_slot_mapping",
+    "csa_inner_state_slot_mapping",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+    "hc_ffn_base",
+    "norm_w",
+    "gate_w",
+    "gate_bias",
+    "tid2eid",
+    "routed_w1",
+    "routed_w1_scale",
+    "routed_w3",
+    "routed_w3_scale",
+    "routed_w2",
+    "routed_w2_scale",
+    "shared_w1",
+    "shared_w1_scale",
+    "shared_w3",
+    "shared_w3_scale",
+    "shared_w2",
+    "shared_w2_scale",
+    "hc_head_fn",
+    "hc_head_scale",
+    "hc_head_base",
+    "final_norm_w",
+    "pre_hc_hidden_out",
+    "lm_head_weight",
+    "hidden_out",
+    "logits",
+    "num_tokens_per_owner",
+    "logit_row_indices",
+)
+
+_PREFILL_FWD_DYNAMIC_TENSOR_NAMES = frozenset(
+    {
+        "ori_slot_mapping",
+        "position_ids",
+        "input_ids",
+        "hca_cmp_slot_mapping",
+        "hca_state_slot_mapping",
+        "csa_cmp_slot_mapping",
+        "csa_idx_slot_mapping",
+        "csa_state_slot_mapping",
+        "csa_inner_state_slot_mapping",
+    }
+)
+
+# Argument order for the packed all-43-layer ``l3_decode_fwd`` kernel. This
+# mirrors pypto-lib decode_fwd.py ``l3_decode_fwd`` host signature: after the
+# ``hc_head`` collapse weights the kernel performs final RMSNorm and device
+# LM-head projection.
+_DECODE_FWD_TENSOR_ORDER = (
+    "embed_weight",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_attn_base",
+    "attn_norm_w",
+    "wq_a",
+    "wq_b",
+    "wq_b_scale",
+    "wkv",
+    "gamma_cq",
+    "gamma_ckv",
+    "kv_cache",
+    "attn_sink",
+    "wo_a",
+    "wo_b",
+    "wo_b_scale",
+    "hca_cmp_wkv",
+    "hca_cmp_wgate",
+    "hca_cmp_ape",
+    "hca_cmp_norm_w",
+    "hca_compress_state",
+    "csa_cmp_wkv",
+    "csa_cmp_wgate",
+    "csa_cmp_ape",
+    "csa_cmp_norm_w",
+    "csa_compress_state",
+    "csa_idx_wq_b",
+    "csa_idx_wq_b_scale",
+    "csa_weights_proj",
+    "csa_hadamard_idx",
+    "csa_inner_wkv",
+    "csa_inner_wgate",
+    "csa_inner_ape",
+    "csa_inner_norm_w",
+    "csa_inner_compress_state",
+    "cmp_kv",
+    "idx_kv_cache",
+    "idx_kv_scale",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+    "hc_ffn_base",
+    "norm_w",
+    "gate_w",
+    "gate_bias",
+    "tid2eid",
+    "routed_w1",
+    "routed_w1_scale",
+    "routed_w3",
+    "routed_w3_scale",
+    "routed_w2",
+    "routed_w2_scale",
+    "shared_w1",
+    "shared_w1_scale",
+    "shared_w3",
+    "shared_w3_scale",
+    "shared_w2",
+    "shared_w2_scale",
+    "freqs_cos",
+    "freqs_sin",
+    "block_table",
+    "position_ids",
+    "kv_seq_lens",
+    "hca_compress_state_block_table",
+    "csa_compress_state_block_table",
+    "csa_inner_compress_state_block_table",
+    "cmp_block_table",
+    "idx_block_table",
+    "block_counts",
+    "input_ids",
+    "hc_head_fn",
+    "hc_head_scale",
+    "hc_head_base",
+    "final_norm_w",
+    "pre_hc_hidden_out",
+    "lm_head_weight",
+    "hidden_out",
+    "logits",
+    "sampled_ids",
+    "num_tokens_per_owner",
+    "logit_row_indices",
+)
+
+_MTP_PREFILL_TENSOR_ORDER = (
+    "hidden_states", "prev_hidden_states",
+    "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table", "ori_slot_mapping",
+    "position_ids", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+    "gate_w", "gate_bias", "tid2eid", "input_ids",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
+    "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
+    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+    "lm_head_weight", "hidden_out", "pre_hc_hidden_out", "logits", "logit_row_indices",
+)
+
+_MTP_DECODE_TENSOR_ORDER = (
+    "embed_weight", "main_pre_hc_hidden", "tail_pre_hc_pool",
+    "accepted_counts", "tail_slot_ids", "position_ids",
+    "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table",
+    "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+    "gate_w", "gate_bias", "tid2eid", "input_ids",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
+    "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
+    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
+    "logit_row_indices",
+)
+
+# The fused K=1 kernel owns persistent draft state, while the standalone MTP
+# kernel used to build additional K>1 drafts keeps the original stateless ABI.
+_FUSED_MTP_DECODE_TENSOR_ORDER = (
+    *_MTP_DECODE_TENSOR_ORDER[:5],
+    "state_generations", "state_tokens", "state_meta",
+    *_MTP_DECODE_TENSOR_ORDER[5:],
+)
+
+_FUSED_MTP_SHARED_TENSORS = frozenset(
+    {
+        "embed_weight",
+        "main_pre_hc_hidden",
+        "freqs_cos",
+        "freqs_sin",
+        "ori_block_table",
+        "lm_head_weight",
+    }
+)
 
 _MTP_DEVICE_STATE_TOKEN_WIDTH = 2
 _MTP_DEVICE_STATE_META_WIDTH = 4
@@ -741,11 +1013,12 @@ class DeepSeekV4CompiledKernels:
 
 @dataclass(frozen=True)
 class DeepSeekV4PreparedPrefillInputs:
-    """Fixed-shape host tensors derived from one serving prefill chunk."""
+    """Tile-padded dynamic host tensors for one serving prefill chunk."""
 
     request_ids: tuple[str, ...]
     ranks: tuple[int, ...]
     actual_tokens: tuple[int, ...]
+    kernel_tokens: int
     x_hc: torch.Tensor
     input_ids: torch.Tensor
     position_ids: torch.Tensor
@@ -1387,6 +1660,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
         if batch.input_embeddings is None:
             raise ValueError("DeepSeek V4 prefill requires host input embeddings")
+        kernel_tokens = self._prefill_kernel_tokens(
+            max(int(tokens) for tokens in batch.chunk_lens),
+            runtime=model.runtime,
+        )
 
         # Prefill writes directly into the scheduler-owned rank-local physical
         # pools. The same worker-resident shards are passed to decode, so no
@@ -1403,7 +1680,6 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             chunk_end = chunk_offset + actual_tokens
             embeddings = batch.input_embeddings[chunk_offset:chunk_end].to(torch.float32).cpu()
             token_ids = batch.token_ids[chunk_offset:chunk_end].detach().cpu().to(torch.long)
-            kernel_tokens = self._prefill_kernel_tokens(actual_tokens)
             kernel_positions = self._prefill_kernel_positions(
                 positions,
                 kernel_tokens=kernel_tokens,
@@ -1411,10 +1687,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             )
             kernel_embeddings_by_request.append(self._padded_rows(embeddings, kernel_tokens))
             input_ids_by_request.append(
-                self._padded_vector(token_ids, layout.prefill_seq, dtype=torch.long)
+                self._padded_vector(token_ids, kernel_tokens, dtype=torch.long)
             )
             position_ids_by_request.append(
-                self._prefill_position_ids(kernel_positions, layout.prefill_seq)
+                self._prefill_position_ids(kernel_positions, kernel_tokens)
             )
             actual_tokens_by_request.append(actual_tokens)
             ori_block_tables.append(
@@ -1465,7 +1741,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         (groups["ori"],),
                         (positions,),
                     )[0],
-                    layout.prefill_seq,
+                    kernel_tokens,
                 )
             )
             hca_cmp_slot_mappings.append(
@@ -1476,7 +1752,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         block_size=layout.block_size,
                         compress_ratio=128,
                     )[0],
-                    layout.prefill_seq,
+                    kernel_tokens,
                 )
             )
             hca_state_slot_mappings.append(
@@ -1486,7 +1762,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         (positions,),
                         state_block_size=layout.c128_state_block_size,
                     )[0],
-                    layout.prefill_seq,
+                    kernel_tokens,
                 )
             )
             csa_cmp_slot_mappings.append(
@@ -1497,7 +1773,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         block_size=layout.block_size,
                         compress_ratio=4,
                     )[0],
-                    layout.prefill_seq,
+                    kernel_tokens,
                 )
             )
             csa_idx_slot_mappings.append(
@@ -1508,7 +1784,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         block_size=layout.block_size,
                         compress_ratio=4,
                     )[0],
-                    layout.prefill_seq,
+                    kernel_tokens,
                 )
             )
             csa_state_slot_mappings.append(
@@ -1518,7 +1794,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         (positions,),
                         state_block_size=layout.c4_state_block_size,
                     )[0],
-                    layout.prefill_seq,
+                    kernel_tokens,
                 )
             )
             csa_inner_state_slot_mappings.append(
@@ -1528,7 +1804,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         (positions,),
                         state_block_size=layout.c4_state_block_size,
                     )[0],
-                    layout.prefill_seq,
+                    kernel_tokens,
                 )
             )
 
@@ -1546,10 +1822,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             request_ids=tuple(batch.request_ids),
             ranks=ranks,
             actual_tokens=tuple(actual_tokens_by_request),
+            kernel_tokens=kernel_tokens,
             x_hc=builder.prefill_x_hc(
                 kernel_embeddings_by_request,
                 ranks=ranks,
-                token_rows=layout.prefill_seq,
+                token_rows=kernel_tokens,
             ),
             input_ids=self._rank_scatter(input_ids_by_request, ranks),
             position_ids=self._rank_scatter(position_ids_by_request, ranks),
@@ -2093,7 +2370,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         ):
             self._stage_prefill_fwd_inputs(inputs)
             self._prefill_task_args.clear_outputs()
-            args = self._prefill_fwd_args()
+            args = self._prefill_fwd_args(inputs.kernel_tokens)
             pre_hc_hidden_buffer = self._prefill_task_args.tensors["pre_hc_hidden_out"]
             logits_buffer = self._prefill_task_args.tensors["logits"]
         try:
@@ -2413,7 +2690,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 cat="executor",
             ):
                 speculative_batch = self._device_state_placeholder_batch(batch)
-                inputs = self.prepare_mtp_decode_inputs(model, speculative_batch)
+                inputs = self.prepare_decode(model, speculative_batch, buffer_slot=0)
         else:
             inputs = prepared
         if inputs.mtp_tail_slot_ids is None:
@@ -2905,13 +3182,32 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._materialize_resident_weights()
         self._l3_shared_buffers_ready = True
 
-    def _prefill_fwd_args(self) -> tuple[Any, ...]:
+    def _prefill_fwd_args(self, kernel_tokens: int) -> tuple[Any, ...]:
         """Build the single packed ``l3_prefill_fwd`` argument tuple.
 
         The kernel runs final RMSNorm and the device-side LM-head. Every positional
         arg is declared on ``_prefill_task_args`` (see ``deepseek/task_args.py``).
         """
-        return self._prefill_task_args.build()
+        args = self._prefill_task_args.build()
+        dynamic_names = {
+            "x_hc",
+            "ori_slot_mapping",
+            "position_ids",
+            "input_ids",
+            "hca_cmp_slot_mapping",
+            "hca_state_slot_mapping",
+            "csa_cmp_slot_mapping",
+            "csa_idx_slot_mapping",
+            "csa_state_slot_mapping",
+            "csa_inner_state_slot_mapping",
+            "hidden_out",
+        }
+        return tuple(
+            self._prefill_token_view(arg, kernel_tokens)
+            if name in dynamic_names
+            else arg
+            for name, arg in zip(self._prefill_task_args.names, args, strict=True)
+        )
 
     def _decode_fwd_args(self, inputs: DeepSeekV4PreparedDecodeInputs) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple from the decode TaskArgs.
@@ -4113,6 +4409,22 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         )
         return host_row
 
+    def _read_mtp_prefill_pre_hc(self, owner_rank: int, *, row: int) -> torch.Tensor:
+        """Read one recurrent hidden row needed by arbitrary-depth MTP."""
+        buffers = self._require_mtp_buffers()
+        device_pre_hc = self._mtp_prefill_task_args.tensors["pre_hc_hidden_out"]
+        host_row = buffers.prefill_pre_hc_mirror[owner_rank, row]
+        shard = device_pre_hc.shards[owner_rank]
+        worker_id = device_pre_hc.worker_ids[owner_rank]
+        row_nbytes = host_row.numel() * host_row.element_size()
+        self._shared_l3_worker().copy_from(
+            host_row.data_ptr(),
+            shard.data_ptr + row * row_nbytes,
+            row_nbytes,
+            worker_id=worker_id,
+        )
+        return host_row.detach().cpu().clone()
+
     def _materialize_mtp_device_state_tokens(self) -> StackedDeviceTensor:
         """Allocate persistent tail/draft token slots on every rank."""
         stacked = self._mtp_device_state_tokens
@@ -4390,10 +4702,77 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             result[int(rank)].copy_(tensor)
         return result.contiguous()
 
-    def _prefill_kernel_tokens(self, actual_tokens: int) -> int:
+    def _prefill_active_token_limit(self, runtime: RuntimeConfig | None) -> int:
+        """Return the configured active-token limit for one main-prefill call."""
+        limits = [DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS]
+        if self._compiled.num_speculative_tokens:
+            limits.append(self._compiled.layout.prefill_seq)
+        if runtime is not None:
+            limits.append(int(runtime.max_num_batched_tokens))
+            limits.append(int(runtime.max_seq_len))
+            if runtime.max_prefill_tokens_per_request is not None:
+                limits.append(int(runtime.max_prefill_tokens_per_request))
+        if any(limit <= 0 for limit in limits):
+            raise ValueError("DeepSeekV4 prefill token limits must be positive")
+        return min(limits)
+
+    def _prefill_buffer_tokens(self) -> int:
+        """Size mutable shared storage before the persistent worker forks."""
+        runtime_model = self._compiled.runtime_model
+        if runtime_model is None:
+            return self._compiled.layout.prefill_seq
+        return self._prefill_kernel_tokens(
+            self._prefill_active_token_limit(runtime_model.runtime),
+            runtime=runtime_model.runtime,
+        )
+
+    def _prefill_kernel_tokens(
+        self,
+        actual_tokens: int,
+        *,
+        runtime: RuntimeConfig | None = None,
+    ) -> int:
         if actual_tokens <= 0:
             raise ValueError("actual_tokens must be positive")
-        return self._compiled.layout.prefill_seq
+        active_limit = self._prefill_active_token_limit(runtime)
+        if actual_tokens > active_limit:
+            mode = "MTP" if self._compiled.num_speculative_tokens else "main"
+            raise ValueError(
+                f"DeepSeekV4 {mode} prefill received {actual_tokens} active tokens; "
+                f"the configured single-request limit is {active_limit}"
+            )
+        tile_tokens = self._compiled.layout.prefill_seq
+        kernel_tokens = ((int(actual_tokens) + tile_tokens - 1) // tile_tokens) * tile_tokens
+        if kernel_tokens > DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS:
+            raise ValueError(
+                f"DeepSeekV4 main prefill kernel supports at most "
+                f"{DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS} rows, got {kernel_tokens}"
+            )
+        return kernel_tokens
+
+    def _prefill_token_view(self, storage: torch.Tensor, kernel_tokens: int) -> torch.Tensor:
+        """Pack a variable token extent into pre-fork shared storage."""
+        layout = self._compiled.layout
+        if storage.ndim < 2 or int(storage.shape[0]) != layout.ranks:
+            raise ValueError(
+                "DeepSeekV4 prefill storage must start with "
+                f"[ranks, capacity], got shape={tuple(storage.shape)}"
+            )
+        if not storage.is_contiguous():
+            raise ValueError("DeepSeekV4 prefill storage must be contiguous")
+        kernel_tokens = int(kernel_tokens)
+        capacity = int(storage.shape[1])
+        if kernel_tokens <= 0 or kernel_tokens > capacity:
+            raise ValueError(
+                f"DeepSeekV4 prefill extent {kernel_tokens} exceeds shared capacity {capacity}"
+            )
+        tail_shape = tuple(int(dim) for dim in storage.shape[2:])
+        used_elements = layout.ranks * kernel_tokens * math.prod(tail_shape)
+        return storage.reshape(-1)[:used_elements].view(
+            layout.ranks,
+            kernel_tokens,
+            *tail_shape,
+        )
 
     @staticmethod
     def _prefill_kernel_positions(
@@ -4406,12 +4785,17 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise ValueError("positions must not be empty")
         if kernel_tokens < len(positions):
             raise ValueError("kernel_tokens must cover all active positions")
-        start = int(positions[0])
-        kernel_positions = list(range(start, start + kernel_tokens))
-        if kernel_positions[-1] >= max_seq_len:
+        active_positions = [int(position) for position in positions]
+        if active_positions[0] < 0 or active_positions[-1] >= max_seq_len:
             raise ValueError(
-                f"prefill static kernel position {kernel_positions[-1]} exceeds max_seq_len={max_seq_len}"
+                f"prefill active positions [{active_positions[0]}, {active_positions[-1]}] "
+                f"exceed max_seq_len={max_seq_len}"
             )
+        kernel_positions = list(active_positions)
+        next_position = active_positions[-1] + 1
+        while len(kernel_positions) < kernel_tokens:
+            kernel_positions.append(min(next_position, max_seq_len - 1))
+            next_position += 1
         return kernel_positions
 
     @staticmethod
