@@ -1495,27 +1495,76 @@ def test_deepseek_cache_metadata_maps_scheduler_block_ids():
     state_base = 64 * 8
     assert hca_state_mapping.tolist() == [[state_base, state_base + 7, state_base + 8]]
 
+    cmp_blocks = list(range(64, 128))
+    long_cmp_mapping = metadata.compressed_slot_mapping_from_ids(
+        [cmp_blocks],
+        [[3, 4095, 4099, 8191]],
+        block_size=128,
+        compress_ratio=4,
+    )
+    assert long_cmp_mapping.tolist() == [
+        [64 * 32, 95 * 32 + 31, 96 * 32, 127 * 32 + 31]
+    ]
+
+    with pytest.raises(ValueError, match="position 4099 requires source block 32"):
+        metadata.compressed_slot_mapping_from_ids(
+            [cmp_blocks[:32]],
+            [[4099]],
+            block_size=128,
+            compress_ratio=4,
+        )
+
 
 def test_deepseek_cache_group_specs_leave_physical_capacity_for_runtime_sizing():
     compress_ratios = (0, 0, *([4] * 21), *([128] * 20))
-    specs = build_deepseek_v4_cache_group_specs(43, compress_ratios, decode_batch=8)
+    specs = build_deepseek_v4_cache_group_specs(
+        43,
+        compress_ratios,
+        decode_batch=8,
+        max_seq_len=8192,
+    )
     by_name = {spec.name: spec for spec in specs}
 
     assert all(spec.num_blocks is None for spec in specs)
     assert by_name["ori"].spec.page_size_bytes == 43 * 128 * 512 * 2
+    assert by_name["cmp_c128"].max_blocks_per_seq == 64
+    assert by_name["cmp_c4"].max_blocks_per_seq == 64
+    assert by_name["idx"].max_blocks_per_seq == 64
     assert by_name["cmp_c128"].spec.page_size_bytes == 20 * (128 // 128) * 512 * 2
     assert by_name["cmp_c4"].spec.page_size_bytes == 21 * (128 // 4) * 512 * 2
     assert by_name["idx"].spec.page_size_bytes == 21 * (128 // 4) * (128 + 4)
     assert by_name["hca_state"].spec.page_size_bytes == 20 * 8 * 1024 * 4
     assert deepseek_v4_cache_blocks_for_slots(specs, 3) == {
         "ori": 12,
-        "cmp_c128": 384,
-        "cmp_c4": 384,
-        "idx": 384,
+        "cmp_c128": 192,
+        "cmp_c4": 192,
+        "idx": 192,
         "hca_state": 144,
         "csa_state": 195,
         "csa_inner_state": 195,
     }
+
+
+def test_deepseek_cache_group_specs_cover_configured_decode_tail():
+    specs = build_deepseek_v4_cache_group_specs(
+        43,
+        (0, 0, *([4] * 21), *([128] * 20)),
+        decode_batch=8,
+        max_seq_len=8320,
+    )
+    by_name = {spec.name: spec for spec in specs}
+
+    assert by_name["cmp_c128"].max_blocks_per_seq == 65
+    assert by_name["cmp_c4"].max_blocks_per_seq == 65
+    assert by_name["idx"].max_blocks_per_seq == 65
+
+    with pytest.raises(ValueError, match="needs 129 source-token blocks"):
+        build_deepseek_v4_cache_group_specs(
+            43,
+            (0, 0, *([4] * 21), *([128] * 20)),
+            decode_batch=8,
+            max_seq_len=16385,
+        )
 
 
 def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch):
@@ -1537,6 +1586,7 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch
         43,
         runner._compiled.compress_ratios,
         decode_batch=layout.decode_batch,
+        max_seq_len=4096,
     )
     memory = {
         "npu:2": (5_000_000_000, 10_000_000_000),
@@ -1571,6 +1621,7 @@ def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch
         43,
         runner._compiled.compress_ratios,
         decode_batch=layout.decode_batch,
+        max_seq_len=4096,
     )
     attempts = []
     ori_blocks_per_slot = runner._cache_group_specs[0].max_blocks_per_seq
@@ -1775,6 +1826,11 @@ def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
         actual_tokens,
         4,
     ).to(torch.bfloat16)
+    grouped_rows = _grouped_cache_rows(1)
+    compressed_blocks = max(1, (actual_tokens + 127) // 128)
+    grouped_rows[0]["cmp_c128"] = list(range(100, 100 + compressed_blocks))
+    grouped_rows[0]["cmp_c4"] = list(range(200, 200 + compressed_blocks))
+    grouped_rows[0]["idx"] = list(range(300, 300 + compressed_blocks))
 
     prepared = runner.prepare_prefill_inputs(
         model,
@@ -1786,7 +1842,7 @@ def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
             chunk_lens=[actual_tokens],
             chunk_offsets=[0],
             chunk_starts=[0],
-            block_ids_by_group=_grouped_cache_rows(1),
+            block_ids_by_group=grouped_rows,
             cache_partitions=[0],
         ),
     )
@@ -1809,6 +1865,12 @@ def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
     assert prepared.logit_row_indices[0, 0].item() == actual_tokens - 1
     if actual_tokens < kernel_tokens:
         assert torch.all(prepared.ori_slot_mapping[0, actual_tokens:] == -1)
+    if actual_tokens == 8192:
+        assert prepared.hca_cmp_block_table[0, :64].tolist() == list(range(100, 164))
+        assert prepared.csa_cmp_block_table[0, :64].tolist() == list(range(200, 264))
+        assert prepared.csa_cmp_slot_mapping[0, 3].item() == 200 * 32
+        assert prepared.csa_cmp_slot_mapping[0, 4099].item() == 232 * 32
+        assert prepared.csa_cmp_slot_mapping[0, 8191].item() == 263 * 32 + 31
 
 
 def test_deepseek_prepare_prefill_inputs_pads_mixed_ranks_to_one_dynamic_extent():

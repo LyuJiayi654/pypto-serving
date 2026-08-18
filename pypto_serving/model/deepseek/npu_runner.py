@@ -123,7 +123,9 @@ def build_deepseek_v4_cache_group_specs(
     physical blocks in each rank-local pool is intentionally left unset: the
     runner fills available NPU memory after weights and persistent scratch have
     been materialized, then the engine scales every group to the reported
-    runtime capacity.
+    runtime capacity. Full-history compressed groups are sized from
+    ``max_seq_len`` so distinct logical pages never alias the same physical
+    page within a request.
     """
     decode_batch = int(decode_batch)
     if decode_batch <= 0:
@@ -866,9 +868,15 @@ class DeepSeekV4CacheMetadataBuilder:
                 offset = source_offset // compress_ratio
                 if not block_ids:
                     raise ValueError(f"compressed slot-mapping row {row} has no allocated blocks")
+                if source_block >= len(block_ids):
+                    raise ValueError(
+                        f"compressed slot-mapping row {row} position {position} requires "
+                        f"source block {source_block}, but only {len(block_ids)} blocks "
+                        "are allocated"
+                    )
                 storage_block_size = block_size // compress_ratio
                 mapping[row, col] = (
-                    int(block_ids[source_block % len(block_ids)]) * storage_block_size + offset
+                    int(block_ids[source_block]) * storage_block_size + offset
                 )
         return mapping
 
