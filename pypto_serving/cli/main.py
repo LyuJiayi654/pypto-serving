@@ -322,11 +322,7 @@ def _build_runtime_config(
             enable_mtp=num_speculative_tokens == 1,
             max_seq_len=args.max_model_len,
         )
-        max_prefill_tokens_per_request = (
-            layout.prefill_seq
-            if num_speculative_tokens > 0
-            else DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
-        )
+        max_prefill_tokens_per_request = DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
 
     return RuntimeConfig(
         page_size=args.block_size,

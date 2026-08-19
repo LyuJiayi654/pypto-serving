@@ -169,6 +169,40 @@ def test_async_pipeline_waits_for_terminal_prefill_before_first_decode(monkeypat
     assert dispatched[1].decode_requests
 
 
+def test_delayed_prefill_rejection_does_not_stop_valid_dispatch():
+    core, dispatched = _async_pipeline_core()
+    manager = KvCacheManager(num_blocks=8, block_size=2, enable_prefix_cache=True)
+    core.scheduler = Scheduler(
+        SchedulerConfig(
+            max_num_scheduled_tokens=4,
+            max_prefill_tokens_per_request=4,
+            max_seq_len=8,
+            enable_prefix_cache=True,
+            enable_chunk_prefill=False,
+            async_scheduling=True,
+        ),
+        manager,
+    )
+    cached_block = manager.allocate_blocks(1)[0]
+    manager.cache_block(cached_block, manager.compute_block_hashes([1, 2])[0])
+    manager.release(cached_block)
+
+    rejected = Request("rejected", [1, 2, 3, 4, 5, 6, 7], max_new_tokens=1)
+    valid = Request("valid", [9, 8, 7], max_new_tokens=1)
+    core.scheduler.add_request(rejected)
+    core.scheduler.add_request(valid)
+    rejection_queue = asyncio.Queue()
+    core._request_contexts[rejected.request_id] = SimpleNamespace(queue=rejection_queue)
+
+    assert core._try_dispatch_step() is True
+
+    error = rejection_queue.get_nowait()
+    assert isinstance(error, ValueError)
+    assert "uncached prompt length 5" in str(error)
+    assert [request.request_id for request in core.scheduler.running] == [valid.request_id]
+    assert dispatched[0].prefill_requests[0].request_id == valid.request_id
+
+
 def test_async_decode_seq_len_excludes_inflight_placeholders():
     """seq_len must be the context length for THIS step, not req.num_tokens.
 

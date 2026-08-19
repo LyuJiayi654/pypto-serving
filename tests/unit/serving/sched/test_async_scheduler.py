@@ -67,169 +67,224 @@ def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
     )
 
 
+def _prefill_scheduler(*, num_blocks=8, block_size=128, prefix_cache=False, **config):
+    manager = KvCacheManager(num_blocks=num_blocks, block_size=block_size, enable_prefix_cache=prefix_cache)
+    return Scheduler(SchedulerConfig(enable_prefix_cache=prefix_cache, **config), manager)
+
+
+def _scheduled_tuple(item):
+    return item.request.request_id, item.num_computed_tokens, item.num_new_tokens
+
+
+def _drain_prefills(scheduler):
+    waves = []
+    first_waiting = []
+    while scheduler.has_work():
+        output = scheduler.schedule()
+        assert output.scheduled_requests
+        if not waves:
+            first_waiting = [request.request_id for request in scheduler.waiting]
+        waves.append([_scheduled_tuple(item) for item in output.scheduled_requests])
+        sampled = {
+            item.request.request_id: [7]
+            for item in output.scheduled_requests
+            if item.num_computed_tokens + item.num_new_tokens >= item.request.num_prompt_tokens
+        }
+        scheduler.update_from_output(output, sampled)
+    return waves, first_waiting
+
+
+def _assert_prefill_rejected(prompt_len, match, *, budget=512, **config):
+    scheduler = _prefill_scheduler(
+        max_num_scheduled_tokens=budget,
+        max_prefill_tokens_per_request=128,
+        max_seq_len=512,
+        **config,
+    )
+    with pytest.raises(ValueError, match=match):
+        scheduler.add_request(Request("too-long", list(range(prompt_len)), max_new_tokens=1))
+
+
 def _scheduled_prefill_chunks(
     prompt_len: int,
     *,
+    max_scheduled_tokens: int = 512,
     threshold: int = 2048,
+    model_limit: int | None = 128,
+    num_speculative_tokens: int = 1,
 ) -> list[tuple[int, int]]:
-    manager = KvCacheManager(num_blocks=64, block_size=128, enable_prefix_cache=False)
-    scheduler = Scheduler(
-        SchedulerConfig(
-            max_num_scheduled_tokens=512,
-            long_prefill_token_threshold=threshold,
-            max_prefill_tokens_per_request=128,
-            max_seq_len=512,
-            enable_prefix_cache=False,
-            num_speculative_tokens=1,
-            supports_chunked_prefill_with_speculation=True,
-        ),
-        manager,
+    max_seq_len = max(512, prompt_len + 1)
+    scheduler = _prefill_scheduler(
+        num_blocks=(max_seq_len + 127) // 128,
+        max_num_scheduled_tokens=max_scheduled_tokens,
+        long_prefill_token_threshold=threshold,
+        max_prefill_tokens_per_request=model_limit,
+        max_seq_len=max_seq_len,
+        num_speculative_tokens=num_speculative_tokens,
+        supports_chunked_prefill_with_speculation=True,
     )
-    request = Request(
-        request_id="chunked",
-        prompt_token_ids=list(range(prompt_len)),
-        max_new_tokens=1,
-        temperature=0.0,
-    )
+    request = Request("chunked", list(range(prompt_len)), max_new_tokens=1, temperature=0.0)
     scheduler.add_request(request)
+    waves, _ = _drain_prefills(scheduler)
+    assert all(len(wave) == 1 for wave in waves)
+    return [(wave[0][1], wave[0][2]) for wave in waves]
 
-    chunks: list[tuple[int, int]] = []
-    while scheduler.has_work():
-        output = scheduler.schedule()
-        assert len(output.scheduled_requests) == 1
-        scheduled = output.scheduled_requests[0]
-        chunks.append((scheduled.num_computed_tokens, scheduled.num_new_tokens))
-        completes_prompt = (
-            scheduled.num_computed_tokens + scheduled.num_new_tokens >= prompt_len
-        )
-        sampled = {request.request_id: [7]} if completes_prompt else {}
-        scheduler.update_from_output(output, sampled)
-    return chunks
+
+_DYNAMIC_PREFILL_OPTIONS = {"max_scheduled_tokens": 8192, "threshold": 8192, "model_limit": 8192}
+_DYNAMIC_AR_PREFILL_OPTIONS = _DYNAMIC_PREFILL_OPTIONS | {"num_speculative_tokens": 0}
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "expected"),
+    ("prompt_len", "options", "expected"),
     [
-        (127, [(0, 127)]),
-        (128, [(0, 128)]),
-        (129, [(0, 128), (128, 1)]),
-        (255, [(0, 128), (128, 127)]),
-        (256, [(0, 128), (128, 128)]),
-        (257, [(0, 128), (128, 128), (256, 1)]),
+        (127, {}, [(0, 127)]),
+        (128, {}, [(0, 128)]),
+        (129, {}, [(0, 128), (128, 1)]),
+        (257, {}, [(0, 128), (128, 128), (256, 1)]),
+        (129, {"threshold": 64}, [(0, 64), (64, 64), (128, 1)]),
+        (129, {"model_limit": None, "num_speculative_tokens": 0}, [(0, 129)]),
+        (257, _DYNAMIC_AR_PREFILL_OPTIONS, [(0, 257)]),
+        (8192, _DYNAMIC_AR_PREFILL_OPTIONS, [(0, 8192)]),
+        (8191, _DYNAMIC_PREFILL_OPTIONS, [(0, 8191)]),
+        (8192, _DYNAMIC_PREFILL_OPTIONS, [(0, 8192)]),
+        (8193, _DYNAMIC_PREFILL_OPTIONS, [(0, 8192), (8192, 1)]),
     ],
 )
-def test_scheduler_honors_model_prefill_token_limit(prompt_len, expected):
-    assert _scheduled_prefill_chunks(prompt_len) == expected
+def test_scheduler_prefill_chunking_modes(prompt_len, options, expected):
+    assert _scheduled_prefill_chunks(prompt_len, **options) == expected
 
 
-def test_scheduler_user_prefill_threshold_can_be_stricter_than_model_limit():
-    assert _scheduled_prefill_chunks(129, threshold=64) == [
-        (0, 64),
-        (64, 64),
-        (128, 1),
-    ]
-
-
-def test_scheduler_without_model_prefill_limit_preserves_large_prefill():
-    manager = KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False)
-    scheduler = Scheduler(
-        SchedulerConfig(
-            max_num_scheduled_tokens=512,
-            long_prefill_token_threshold=2048,
-            max_seq_len=512,
-            enable_prefix_cache=False,
-        ),
-        manager,
+@pytest.mark.parametrize(("budget", "prompt_len", "expected_limit"), [(512, 129, 128), (64, 80, 64)])
+def test_scheduler_rejects_no_chunk_prefill_over_effective_limit(budget, prompt_len, expected_limit):
+    _assert_prefill_rejected(
+        prompt_len,
+        f"single-dispatch prefill limit {expected_limit}",
+        budget=budget,
+        enable_chunk_prefill=False,
     )
-    request = Request("unrestricted", list(range(129)), max_new_tokens=1)
-    scheduler.add_request(request)
-
-    output = scheduler.schedule()
-
-    assert [item.num_new_tokens for item in output.scheduled_requests] == [129]
-
-
-@pytest.mark.parametrize("prompt_len", [129, 257, 8192])
-def test_scheduler_dynamic_main_prefill_is_not_forced_to_mtp_tile(prompt_len):
-    scheduler = Scheduler(
-        SchedulerConfig(
-            max_num_scheduled_tokens=8192,
-            long_prefill_token_threshold=8192,
-            max_prefill_tokens_per_request=8192,
-            max_seq_len=8193,
-            enable_prefix_cache=False,
-            num_speculative_tokens=0,
-        ),
-        KvCacheManager(num_blocks=128, block_size=128, enable_prefix_cache=False),
-    )
-    scheduler.add_request(
-        Request("dynamic-main", list(range(prompt_len)), max_new_tokens=1)
-    )
-
-    output = scheduler.schedule()
-
-    assert [item.num_new_tokens for item in output.scheduled_requests] == [prompt_len]
-
-
-def test_scheduler_rejects_model_limit_when_chunked_prefill_is_disabled():
-    scheduler = Scheduler(
-        SchedulerConfig(
-            max_prefill_tokens_per_request=128,
-            max_seq_len=512,
-            enable_prefix_cache=False,
-            enable_chunk_prefill=False,
-        ),
-        KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False),
-    )
-
-    with pytest.raises(ValueError, match="single-dispatch prefill limit 128"):
-        scheduler.add_request(Request("too-long", list(range(129)), max_new_tokens=1))
 
 
 def test_scheduler_rejects_multi_chunk_prefill_when_speculation_is_unsupported():
-    scheduler = Scheduler(
-        SchedulerConfig(
-            max_num_scheduled_tokens=512,
-            max_prefill_tokens_per_request=128,
-            max_seq_len=512,
-            enable_prefix_cache=False,
-            num_speculative_tokens=1,
-            supports_chunked_prefill_with_speculation=False,
-        ),
-        KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False),
+    _assert_prefill_rejected(
+        129,
+        "not supported with speculative decoding",
+        num_speculative_tokens=1,
+        supports_chunked_prefill_with_speculation=False,
     )
 
-    with pytest.raises(ValueError, match="not supported with speculative decoding"):
-        scheduler.add_request(Request("mtp-long", list(range(129)), max_new_tokens=1))
 
-
-def test_scheduler_defers_single_dispatch_prefill_on_residual_budget():
-    manager = KvCacheManager(num_blocks=8, block_size=128, enable_prefix_cache=False)
-    scheduler = Scheduler(
-        SchedulerConfig(
-            max_num_scheduled_tokens=128,
-            max_prefill_tokens_per_request=128,
-            max_seq_len=256,
-            enable_prefix_cache=False,
-            num_speculative_tokens=1,
-            supports_chunked_prefill_with_speculation=False,
-        ),
-        manager,
+def test_single_dispatch_limit_counts_only_uncached_prompt_suffix():
+    scheduler = _prefill_scheduler(
+        num_blocks=8,
+        block_size=2,
+        prefix_cache=True,
+        max_num_scheduled_tokens=4,
+        max_prefill_tokens_per_request=4,
+        max_seq_len=8,
+        enable_chunk_prefill=False,
     )
-    first = Request("first", list(range(80)), max_new_tokens=1, temperature=0.0)
-    second = Request("second", list(range(80)), max_new_tokens=1, temperature=0.0)
+    manager = scheduler.kv_cache_manager
+    cached_block = manager.allocate_blocks(1)[0]
+    manager.cache_block(cached_block, manager.compute_block_hashes([1, 2])[0])
+    manager.release(cached_block)
+
+    accepted = Request("accepted", [1, 2, 3, 4, 5, 6], max_new_tokens=1)
+    scheduler.add_request(accepted)
+    accepted_output = scheduler.schedule()
+
+    assert [_scheduled_tuple(item) for item in accepted_output.scheduled_requests] == [
+        ("accepted", 2, 4)
+    ]
+    scheduler.abort_request(accepted.request_id)
+
+    rejected = Request("rejected", [1, 2, 3, 4, 5, 6, 7], max_new_tokens=1)
+    scheduler.add_request(rejected)
+    rejected_output = scheduler.schedule()
+
+    assert rejected_output.is_empty
+    assert "uncached prompt length 5" in rejected_output.rejected_requests[rejected.request_id]
+    assert rejected.request_id not in scheduler.requests
+    assert cached_block.ref_cnt == 0
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "expected_waves", "expected_first_waiting"),
+    [
+        pytest.param(
+            {"num_speculative_tokens": 1, "supports_chunked_prefill_with_speculation": False},
+            [[("first", 0, 80)], [("second", 0, 80)]],
+            ["second"],
+            id="speculation-requires-single-dispatch",
+        ),
+        pytest.param(
+            {"enable_chunk_prefill": False, "long_prefill_token_threshold": 32},
+            [[("first", 0, 80)], [("second", 0, 80)]],
+            ["second"],
+            id="chunk-prefill-disabled",
+        ),
+        pytest.param(
+            {},
+            [[("first", 0, 80), ("second", 0, 48)], [("second", 48, 32)]],
+            [],
+            id="chunk-prefill-enabled",
+        ),
+    ],
+)
+def test_scheduler_residual_budget_respects_single_dispatch_mode(
+    config_overrides, expected_waves, expected_first_waiting
+):
+    scheduler = _prefill_scheduler(
+        max_num_scheduled_tokens=128,
+        max_prefill_tokens_per_request=128,
+        max_seq_len=256,
+        **config_overrides,
+    )
+    for request_id in ("first", "second"):
+        scheduler.add_request(Request(request_id, list(range(80)), max_new_tokens=1, temperature=0.0))
+    waves, first_waiting = _drain_prefills(scheduler)
+    assert first_waiting == expected_first_waiting
+    assert waves == expected_waves
+
+
+def test_scheduler_releases_prefix_hit_when_no_chunk_prefill_is_deferred():
+    scheduler = _prefill_scheduler(
+        num_blocks=16,
+        block_size=2,
+        prefix_cache=True,
+        max_num_scheduled_tokens=4,
+        max_prefill_tokens_per_request=4,
+        max_seq_len=8,
+        enable_chunk_prefill=False,
+    )
+    manager = scheduler.kv_cache_manager
+    cached_prompt = [1, 2, 3, 4]
+    cached_block = manager.allocate_blocks(1)[0]
+    manager.cache_block(cached_block, manager.compute_block_hashes(cached_prompt)[0])
+    manager.release(cached_block)
+    initial_free_blocks = manager.num_free_blocks
+
+    first = Request("first", [9, 8, 7], max_new_tokens=1)
+    deferred = Request("deferred", cached_prompt, max_new_tokens=1)
     scheduler.add_request(first)
-    scheduler.add_request(second)
+    scheduler.add_request(deferred)
 
     first_output = scheduler.schedule()
 
-    assert [item.request.request_id for item in first_output.scheduled_requests] == ["first"]
-    assert first_output.scheduled_requests[0].num_new_tokens == 80
-    assert [request.request_id for request in scheduler.waiting] == ["second"]
+    assert [_scheduled_tuple(item) for item in first_output.scheduled_requests] == [("first", 0, 3)]
+    assert cached_block.ref_cnt == 0
+    assert deferred.cached_block_ids == []
+    assert deferred.num_computed_tokens == 0
+    assert deferred.num_blocks_cached == 0
 
     scheduler.update_from_output(first_output, {"first": [7]})
-    second_output = scheduler.schedule()
-    assert [item.request.request_id for item in second_output.scheduled_requests] == ["second"]
+    deferred_output = scheduler.schedule()
+
+    assert [_scheduled_tuple(item) for item in deferred_output.scheduled_requests] == [("deferred", 2, 2)]
+
+    scheduler.update_from_output(deferred_output, {"deferred": [7]})
+
+    assert cached_block.ref_cnt == 0
+    assert manager.num_free_blocks == initial_free_blocks
 
 
 def test_async_reconciliation_matches_sync_end_state():

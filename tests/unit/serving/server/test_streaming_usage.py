@@ -17,11 +17,19 @@ fake engine so the usage accounting is exercised without a model or NPU.
 
 from __future__ import annotations
 
+import asyncio
 import json
+
+import pytest
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.serving.server.server import CompletionRequest, ServingServer
+from pypto_serving.serving.server.server import (
+    ChatCompletionRequest,
+    ChatMessage,
+    CompletionRequest,
+    ServingServer,
+)
 
 # ---------------------------------------------------------------------------
 # Fake engine
@@ -49,6 +57,12 @@ class _FakeEngine:
     async def add_request(self, request_id, prompt, config, **kwargs):
         for out in self._outputs:
             yield out
+
+
+class _RejectingEngine(_FakeEngine):
+    async def add_request(self, request_id, prompt, config, **kwargs):
+        raise ValueError("uncached prompt length 5 exceeds the single-dispatch limit")
+        yield  # pragma: no cover
 
 
 def _make_server(outputs: list[TokenOutput]) -> ServingServer:
@@ -79,6 +93,37 @@ def _parse_sse(raw: bytes) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("method_name", "route_request"),
+    [
+        ("_completions", CompletionRequest(prompt="cached prefix", stream=False)),
+        (
+            "_chat_completions",
+            ChatCompletionRequest(
+                messages=[ChatMessage(role="user", content="cached prefix")],
+                stream=False,
+            ),
+        ),
+    ],
+)
+def test_non_streaming_scheduler_rejection_reaches_http_400_handler(method_name, route_request):
+    server = ServingServer(
+        async_engine=_RejectingEngine([]),
+        model_id="test-model",
+        generate_config=GenerateConfig(),
+    )
+    message = "uncached prompt length 5 exceeds the single-dispatch limit"
+
+    with pytest.raises(ValueError, match="uncached prompt length 5"):
+        asyncio.run(getattr(server, method_name)(route_request))
+
+    handler = server.app.exception_handlers[ValueError]
+    response = asyncio.run(handler(None, ValueError(message)))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["message"] == message
+
+
 def test_stream_completion_terminal_usage_chunk():
     """Final SSE chunk must have empty choices and correct usage counts."""
     outputs = [
@@ -96,8 +141,6 @@ def test_stream_completion_terminal_usage_chunk():
     server = _make_server(outputs)
 
     from pypto_serving.config.types import GenerateConfig
-    import asyncio
-
     async def collect():
         chunks = []
         async for data in server._stream_completion(
