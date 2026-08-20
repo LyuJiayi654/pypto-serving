@@ -1,77 +1,43 @@
-# DeepSeek V4 NPU Serving Dev Notes
+# DeepSeek V4
 
-These commands are for DeepSeek V4 Flash W8A8 serving checks on shared Ascend
-development machines with `task-submit`. Run them from the pypto-serving
-checkout.
+PyPTO Serving supports DeepSeek V4 Flash through a converted W8A8
+compressed-tensors checkpoint and a fixed eight-device NPU topology. The model
+uses overlapped attention data parallelism and MoE expert parallelism: the same
+eight physical ranks are attention DP=8 and MoE EP=8 ranks.
 
-## Prepare the W8A8 Checkpoint
+## Requirements
 
-PyPTO serving expects a compressed-tensors W8A8 checkpoint. The released
-[`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
-checkpoint instead mixes FP8 weights with packed MXFP4 expert weights, so it
-must be converted before serving. The conversion can run on CPU and does not
-require `torch_npu`, but the source and output checkpoints must use different
-directories. Make sure the machine has enough free disk space for both copies.
+- A converted W8A8 compressed-tensors checkpoint.
+- Exactly eight NPU device IDs.
+- `--dp 8 --ep 8 --tp 1` for HTTP serving.
+- `--block-size 128`.
+- Prefix caching disabled; the server disables it automatically for DeepSeek V4.
 
-Install the download and safetensors dependencies, then verify that the active
-PyPTO environment already provides PyTorch. Use the PyTorch build appropriate
-for that environment instead of replacing it with a generic wheel.
-
-```bash
-python -m pip install --upgrade huggingface_hub safetensors
-python -c "import torch, safetensors; print(torch.__version__)"
-```
-
-Download the original Hybrid FP8/MXFP4 checkpoint. If it is already available
-from another official mirror, use that snapshot directory as `--input-dir`
-instead.
-
-```bash
-hf download deepseek-ai/DeepSeek-V4-Flash \
-  --local-dir /data/models/DeepSeek-V4-Flash
-```
-
-Validate the source checkpoint and print the conversion plan without writing
-any output:
-
-```bash
-python scripts/convert_deepseek_v4_to_w8a8.py \
-  --input-dir /data/models/DeepSeek-V4-Flash \
-  --output-dir /data/models/dsv4-flash-w8a8 \
-  --dry-run
-```
-
-Run the conversion:
-
-```bash
-python scripts/convert_deepseek_v4_to_w8a8.py \
-  --input-dir /data/models/DeepSeek-V4-Flash \
-  --output-dir /data/models/dsv4-flash-w8a8
-```
-
-The converter writes one safetensors shard at a time using atomic replacement.
-If the process is interrupted, rerun the same command with `--resume`:
-
-```bash
-python scripts/convert_deepseek_v4_to_w8a8.py \
-  --input-dir /data/models/DeepSeek-V4-Flash \
-  --output-dir /data/models/dsv4-flash-w8a8 \
-  --resume
-```
-
-A successful run prints `Conversion complete` and leaves a converted
-`config.json`, `model.safetensors.index.json`, safetensors shards, and a
-`.pypto-w8a8-conversion.json` marker in the output directory. The resulting
-index records the total tensor payload size. The directory can be passed
-directly to `pypto-serving` as shown below.
+See [DeepSeek V4 Checkpoint Conversion](deepseek-v4-checkpoint-conversion.md)
+before starting a serving run with the released checkpoint.
 
 ## 8-Device Offline Generation
 
 The offline entry uses the same scheduler, worker process, rank-partitioned
-cache pools, and MTP acceptance path as HTTP serving, without opening a port:
+cache pools, and MTP acceptance path as HTTP serving, without opening a port.
 
 ```bash
-task-submit --device 8,9,10,11,12,13,14,15 --max-time 0 --timeout 0 --ptoas 0.48 --run "PYPTO_RUNTIME_LOG=error PTO2_RING_DEP_POOL=131072 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_HEAP=2147483648 PTO2_OP_EXECUTE_TIMEOUT_US=400000000 PTO2_STREAM_SYNC_TIMEOUT_MS=440000 PTO2_SCHEDULER_TIMEOUT_MS=320000 SERVING_WORKER_STEP_TIMEOUT=1800 python examples/model/deepseek_v4/npu_generate.py --model-dir /data/models/dsv4-flash-w8a8 --prompt 'Huawei is' --platform a2a3 --devices 8,9,10,11,12,13,14,15 --max-seq-len 512 --max-new-tokens 20 --enable-mtp"
+PYPTO_RUNTIME_LOG=error \
+PTO2_RING_DEP_POOL=131072 \
+PTO2_RING_TASK_WINDOW=131072 \
+PTO2_RING_HEAP=2147483648 \
+PTO2_OP_EXECUTE_TIMEOUT_US=400000000 \
+PTO2_STREAM_SYNC_TIMEOUT_MS=440000 \
+PTO2_SCHEDULER_TIMEOUT_MS=320000 \
+SERVING_WORKER_STEP_TIMEOUT=1800 \
+python examples/model/deepseek_v4/npu_generate.py \
+  --model-dir /path/to/dsv4-flash-w8a8 \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --devices 0,1,2,3,4,5,6,7 \
+  --max-seq-len 512 \
+  --max-new-tokens 20 \
+  --enable-mtp
 ```
 
 Use `--num-prompts N` to exercise continuous batching, or add
@@ -86,7 +52,32 @@ the same eight physical ranks, so this is one model replica rather than eight
 independent serving replicas:
 
 ```bash
-task-submit --device 8,9,10,11,12,13,14,15 --max-time 0 --timeout 0 --ptoas 0.48 --run "PYPTO_RUNTIME_LOG=error PTO2_RING_DEP_POOL=131072 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_HEAP=2147483648 PTO2_OP_EXECUTE_TIMEOUT_US=400000000 PTO2_STREAM_SYNC_TIMEOUT_MS=440000 PTO2_SCHEDULER_TIMEOUT_MS=320000 SERVING_WORKER_STEP_TIMEOUT=1800 pypto-serving --model /data/models/dsv4-flash-w8a8 --served-model-name dsv4-flash-w8a8 --backend npu --platform a2a3 --devices 8,9,10,11,12,13,14,15 --dp 8 --ep 8 --tp 1 --block-size 128 --max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 512 --long-prefill-token-threshold 2048 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --no-enable-prefix-caching --port 8225 --show-startup-logs"
+PYPTO_RUNTIME_LOG=error \
+PTO2_RING_DEP_POOL=131072 \
+PTO2_RING_TASK_WINDOW=131072 \
+PTO2_RING_HEAP=2147483648 \
+PTO2_OP_EXECUTE_TIMEOUT_US=400000000 \
+PTO2_STREAM_SYNC_TIMEOUT_MS=440000 \
+PTO2_SCHEDULER_TIMEOUT_MS=320000 \
+SERVING_WORKER_STEP_TIMEOUT=1800 \
+pypto-serving \
+  --model /path/to/dsv4-flash-w8a8 \
+  --served-model-name dsv4-flash-w8a8 \
+  --backend npu \
+  --platform a2a3 \
+  --devices 0,1,2,3,4,5,6,7 \
+  --dp 8 \
+  --ep 8 \
+  --tp 1 \
+  --block-size 128 \
+  --max-model-len 512 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 512 \
+  --long-prefill-token-threshold 2048 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --no-enable-prefix-caching \
+  --port 8225 \
+  --show-startup-logs
 ```
 
 Each NPU runs one prefill row at a time, so DP=8 admits up to eight prefill
@@ -130,23 +121,8 @@ handles and address them with scheduler-owned group block IDs; there is no
 prefill CPU snapshot or cache handoff. Reassigned pages are cleared with
 targeted host-to-device copies before their new owner writes them.
 
-## Optional Prepacked Weights
-
-The 43 hidden layers can be converted once into the final rank-stacked Host
-layout:
-
-```bash
-pypto-prepack-deepseek-v4 /data/models/dsv4-flash-w8a8
-```
-
-The command atomically writes
-`pypto-deepseek-v4-stacked-r8.safetensors` beside the checkpoint. Subsequent
-starts sample its Linux page-cache residency before opening it. A hot sidecar is
-validated against the checkpoint-file and deployment fingerprint, then
-memory-mapped as the final layout instead of repacking every hidden layer. A
-cold, missing, or stale sidecar uses the original checkpoint path, avoiding a
-cold 323 GiB page-fault stream on the weight-upload path. Rebuild with `--force`
-after replacing checkpoint shards or changing the packed rank layout.
+See [DeepSeek V4 Prepacked Weights](deepseek-v4-prepacked-weights.md) for the
+optional sidecar that reduces repeated startup work.
 
 ## Completion Check
 

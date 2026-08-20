@@ -4,6 +4,16 @@ PyPTO Serving is a small local inference stack for running Qwen3-14B and
 DeepSeek V4 generation with PyPTO kernels on Ascend NPUs. It includes an
 installable Python package, model executor integrations and CLI entry points.
 
+## Documentation
+
+The external documentation lives under [`docs/`](docs/index.md). Start with:
+
+- [Prerequisites](docs/get-started/prerequisites.md)
+- [Installation](docs/get-started/installation.md)
+- [Quickstart](docs/get-started/quickstart.md)
+- [Support Matrix](docs/api/support-matrix.md)
+- [HTTP API](docs/api/http-api.md)
+
 ## Layout
 
 ```text
@@ -128,9 +138,9 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
 
 - All model/device/runtime options are passed via CLI arguments. Run
   `pypto-serving --help` for the full list.
-- Parallel serving development notes live in `docs/user-guide/parallel.md`.
-- DeepSeek V4 checkpoint preparation and NPU serving notes live in
-  `docs/models/deepseek-v4.md`.
+- Parallel serving notes live in `docs/user-guide/parallel.md`.
+- DeepSeek V4 checkpoint preparation lives in
+  `docs/models/deepseek-v4-checkpoint-conversion.md`.
 - Generated kernel artifacts are written under `build_output/` and are ignored
   by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the

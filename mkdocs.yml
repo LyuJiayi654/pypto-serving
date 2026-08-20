@@ -111,12 +111,60 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Get Started:
-      - Installation: get-started/installation.md
-      - Quickstart: get-started/quickstart.md
   - User Guide:
-      - Parallel Serving: user-guide/parallel.md
-      - Profiling: user-guide/profile.md
-  - Models:
-      - Qwen3: models/qwen.md
-      - DeepSeek V4: models/deepseek-v4.md
+      - Getting Started:
+          - Prerequisites: get-started/prerequisites.md
+          - Installation: get-started/installation.md
+          - Quickstart: get-started/quickstart.md
+      - Inference and Serving:
+          - Offline Inference: user-guide/offline-inference.md
+          - Online Serving: user-guide/online-serving.md
+          - OpenAI-Compatible Server: user-guide/openai-compatible-server.md
+          - Streaming: user-guide/streaming.md
+          - Parallelism and Scaling: user-guide/parallel.md
+          - Profiling: user-guide/profile.md
+          - Performance Tuning: user-guide/performance-tuning.md
+          - Troubleshooting: user-guide/troubleshooting.md
+      - Models:
+          - Model Overview: models/overview.md
+          - Qwen3-14B: models/qwen.md
+          - DeepSeek V4: models/deepseek-v4.md
+          - DeepSeek V4 Checkpoint Conversion: models/deepseek-v4-checkpoint-conversion.md
+          - DeepSeek V4 Prepacked Weights: models/deepseek-v4-prepacked-weights.md
+      - Configuration:
+          - Server Arguments: configuration/server-arguments.md
+          - Generation Arguments: configuration/generation-arguments.md
+          - Parallel Configuration: configuration/parallel-config.md
+          - Environment Variables: configuration/environment-variables.md
+  - Features:
+      - Feature Overview: features/overview.md
+      - Ascend NPU Backend: features/ascend-npu-backend.md
+      - PyPTO Kernels: features/pypto-kernels.md
+      - Continuous Batching: features/continuous-batching.md
+      - KV Cache: features/kv-cache.md
+      - Chunked Prefill: features/chunked-prefill.md
+      - Prefix Caching: features/prefix-caching.md
+      - MTP Speculative Decoding: features/speculative-decoding-mtp.md
+      - Chrome Trace Profiling: features/chrome-trace-profiling.md
+      - Compile Cache: features/compile-cache.md
+  - Benchmarking:
+      - Overview: benchmarking/overview.md
+      - Offline Benchmarking: benchmarking/offline-benchmark.md
+      - Serving Benchmarking: benchmarking/serving-benchmark.md
+      - Profile Analysis: benchmarking/profiling-analysis.md
+  - API Reference:
+      - Support Matrix: api/support-matrix.md
+      - HTTP API: api/http-api.md
+      - Python API: api/python-api.md
+      - Error Reference: api/error-reference.md
+  - CLI Reference:
+      - pypto-serving: cli/pypto-serving.md
+      - pypto-prepack-deepseek-v4: cli/pypto-prepack-deepseek-v4.md
+      - Conversion Tools: cli/conversion-tools.md
+  - Developer Guide:
+      - Architecture: developer-guide/architecture.md
+      - Scheduler and KV Cache: developer-guide/scheduler-and-kv-cache.md
+      - Worker and Executor: developer-guide/worker-and-executor.md
+      - Add a Model: developer-guide/add-a-model.md
+      - Testing: developer-guide/testing.md
+      - Contributing: developer-guide/contributing.md

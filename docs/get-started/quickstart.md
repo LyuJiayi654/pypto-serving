@@ -1,8 +1,12 @@
 # Quickstart
 
-## One-Shot NPU Generation
+This page runs the shortest end-to-end path: one Qwen3-14B offline generation,
+then the OpenAI-compatible HTTP server. See the DeepSeek V4 model guide for
+the eight-device W8A8 path.
 
-Run a single Qwen3-14B generation on an Ascend NPU:
+## Offline Qwen3-14B Generation
+
+Run one generation on a single Ascend NPU:
 
 ```bash
 python examples/model/qwen3_14b/npu_generate.py \
@@ -14,21 +18,12 @@ python examples/model/qwen3_14b/npu_generate.py \
   --max-new-tokens 5
 ```
 
-For DeepSeek V4 Flash W8A8 offline generation on eight devices:
-
-```bash
-python examples/model/deepseek_v4/npu_generate.py \
-  --model-dir /data/models/dsv4-flash-w8a8 \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
-  --devices 0,1,2,3,4,5,6,7 \
-  --max-seq-len 512 \
-  --max-new-tokens 20
-```
+Expected output includes generated text, token IDs, a finish reason, and a
+throughput summary. The first run may spend extra time compiling kernels.
 
 ## HTTP Serving
 
-Start the OpenAI-compatible HTTP server:
+Start the server on one device:
 
 ```bash
 pypto-serving \
@@ -40,7 +35,7 @@ pypto-serving \
   --port 8899
 ```
 
-Wait for the server to log `Application startup complete`, then send requests:
+Wait for `Application startup complete`, then send requests from another shell:
 
 ```bash
 # Health check
@@ -62,7 +57,17 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
 ```
 
+The completion response includes one choice and usage counts when the request
+finishes. Streaming responses are Server-Sent Events and end with
+`data: [DONE]`.
+
 ## Next Steps
 
-- [Parallel Serving](../user-guide/parallel.md) — configure DP, TP, and EP
-- [Profiling](../user-guide/profile.md) — enable performance tracing
+- [Offline Inference](../user-guide/offline-inference.md): run larger offline
+  validation workloads.
+- [Online Serving](../user-guide/online-serving.md): configure the HTTP server.
+- [OpenAI-Compatible Server](../user-guide/openai-compatible-server.md):
+  understand the supported API subset.
+- [Parallelism and Scaling](../user-guide/parallel.md): configure DP, TP, and
+  DeepSeek V4 overlapped DP/EP.
+- [Profiling](../user-guide/profile.md): capture Chrome trace profiles.
