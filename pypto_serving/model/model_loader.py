@@ -71,6 +71,35 @@ class ModelFormatLoader(Protocol):
         raise NotImplementedError
 
 
+class SafetensorsDirectoryLoader:
+    """Shared behaviour for loaders that read a local safetensors checkpoint directory.
+
+    Only what is genuinely common lives here. Format matching is identical for every such
+    loader, and every one needs a `config.json` before any of its own checks can mean anything,
+    so `can_load` splits into that precondition plus a family-specific `_recognises` hook.
+
+    `load` is deliberately not here: the two families produce different things from a
+    directory — one stages layers lazily from a Hugging Face tree, the other validates a
+    quantized checkpoint contract — and a shared skeleton would be a hook for every step.
+    """
+
+    format_names: tuple[str, ...] = ()
+
+    def supports_format(self, model_format: str) -> bool:
+        """Return whether ``model_format`` names this loader."""
+        return model_format.lower() in self.format_names
+
+    def can_load(self, model_path: Path) -> bool:
+        """Return whether this loader recognises *model_path*."""
+        if not (model_path / "config.json").exists():
+            return False
+        return self._recognises(model_path)
+
+    def _recognises(self, model_path: Path) -> bool:
+        """Family-specific detection, given that ``config.json`` exists."""
+        raise NotImplementedError
+
+
 def _load_safetensors_weight_map(model_dir: Path) -> dict[str, str]:
     """Return the ``{tensor_name: shard_filename}`` map from a safetensors index.
 
@@ -201,25 +230,16 @@ def _cast_weight(weight: torch.Tensor, runtime: RuntimeConfig) -> torch.Tensor:
     return weight.to(device=runtime.device, dtype=dtype)
 
 
-class HuggingFaceDirectoryLoader:
+class HuggingFaceDirectoryLoader(SafetensorsDirectoryLoader):
     """Loader for local Hugging Face-style decoder model directories."""
 
     format_names = ("huggingface", "hf")
 
-    def supports_format(self, model_format: str) -> bool:
-        """Return whether ``model_format`` names the Hugging Face loader."""
-        return model_format.lower() in self.format_names
-
-    def can_load(self, model_path: Path) -> bool:
-        """Detect a local directory with config and safetensors weights."""
-        config_path = model_path / "config.json"
-        if not config_path.exists():
-            return False
+    def _recognises(self, model_path: Path) -> bool:
+        """Accept any directory carrying safetensors weights, indexed or single-shard."""
         if (model_path / "model.safetensors.index.json").exists():
             return True
-        if any(model_path.glob("*.safetensors")):
-            return True
-        return False
+        return any(model_path.glob("*.safetensors"))
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
         """Load a supported Hugging Face directory into runtime tensors."""
@@ -288,23 +308,22 @@ class HuggingFaceDirectoryLoader:
         )
 
 
-class DeepSeekV4W8A8DirectoryLoader:
+class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
     """Lazy loader for the local DeepSeekV4 Flash W8A8 checkpoint."""
 
     format_names = ("deepseek_v4_w8a8", "deepseek-v4-w8a8", "dsv4-w8a8")
 
-    def supports_format(self, model_format: str) -> bool:
-        """Return whether ``model_format`` names the DeepSeekV4 W8A8 loader."""
-        return model_format.lower() in self.format_names
+    def _recognises(self, model_path: Path) -> bool:
+        """Require a shard index and a config that names DeepSeekV4.
 
-    def can_load(self, model_path: Path) -> bool:
-        """Detect a DeepSeekV4 compressed-tensors checkpoint directory."""
-        config_path = model_path / "config.json"
-        index_path = model_path / "model.safetensors.index.json"
-        if not config_path.exists() or not index_path.exists():
+        Stricter than the Hugging Face loader on purpose: this one only claims a directory it
+        can actually serve, so an unreadable config is a "no" rather than an error — the
+        registry goes on to ask the next loader.
+        """
+        if not (model_path / "model.safetensors.index.json").exists():
             return False
         try:
-            config_data = json.loads(config_path.read_text())
+            config_data = json.loads((model_path / "config.json").read_text())
         except json.JSONDecodeError:
             return False
         return _is_deepseek_v4_config(config_data)

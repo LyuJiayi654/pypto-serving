@@ -1055,10 +1055,16 @@ def pack_deepseek_v4_layer_weights(
 ) -> DeepSeekV4PackedLayerWeights:
     """Pack raw checkpoint tensors into new buffers or final-layout destinations.
 
-    Evaluates the declarative layer contract in ``weight_spec.py``. The hand-written packer it
-    replaced was kept as a parity reference while the refactor landed and is gone now that the
-    differential has run green; ``git log`` has both sides if a byte-level question ever comes
-    back.
+    This is DeepSeekV4's binding to the generic evaluator, not a pass-through: it turns the
+    family's arguments into a :class:`LayerContext`, selects the rank and expert-placement
+    policies, supplies the synthetic-weight factories, and carries the two error templates its
+    callers' diagnostics are matched against. Both production callers
+    (:meth:`DeepSeekV4WeightStore.load_packed_layer_weights` and
+    :meth:`~DeepSeekV4WeightStore.load_mtp_weights`) would otherwise repeat that wiring, and
+    the MTP path would have to know to pass ``prefix="mtp.0"`` through it.
+
+    The rules themselves live in ``weight_spec.py``; what is here is the argument surface the
+    rest of the DeepSeekV4 code already calls.
     """
     from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
     from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
