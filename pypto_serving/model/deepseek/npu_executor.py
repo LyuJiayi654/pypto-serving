@@ -57,6 +57,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "decode_metadata",
     "decode_mtp",
     "decode_mtp_verify",
+    "decode_prepare",
     "lookup_embedding",
     "decode_sparse_attn_csa",
     "decode_sparse_attn_hca",
@@ -362,7 +363,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 if not use_fused_mtp:
                     mtp_decode = self._compile_l3_callable(
                         "deepseek_v4_mtp_decode",
-                        modules["decode_mtp"].l3_mtp_decode_layer,
+                        modules["decode_mtp"].l3_decode_mtp,
                         layout=layout,
                         runtime_scalar_names=frozenset({"num_tokens"}),
                     )

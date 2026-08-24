@@ -189,10 +189,14 @@ class ReplicaEngineCore:
             max_num_running_reqs=self.config.max_num_running_reqs,
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
+            max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
             num_speculative_tokens=runtime.num_speculative_tokens,
+            supports_chunked_prefill_with_speculation=(
+                runtime.supports_chunked_prefill_with_speculation
+            ),
             async_scheduling=self._async_scheduling,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
@@ -399,7 +403,11 @@ class ReplicaEngineCore:
         finished_normally = False
         try:
             while True:
-                output: TokenOutput = await ctx.queue.get()
+                queued = await ctx.queue.get()
+                if isinstance(queued, BaseException):
+                    self._request_contexts.pop(request_id, None)
+                    raise queued
+                output: TokenOutput = queued
                 yield output
                 if output.finished:
                     finished_normally = True
@@ -494,6 +502,13 @@ class ReplicaEngineCore:
         """
         with profile_span("scheduler.schedule", cat="scheduler"):
             scheduler_output = self.scheduler.schedule()
+        for request_id, reason in scheduler_output.rejected_requests.items():
+            logger.warning("request %s rejected during scheduling: %s", request_id, reason)
+            ctx = self._request_contexts.get(request_id)
+            if ctx is not None:
+                ctx.queue.put_nowait(ValueError(reason))
+            if request_id in self._worker_known_req_ids:
+                self._schedule_worker_free(request_id)
         # Preempted requests must release their worker-side cache / device slots;
         # queue their ids so the next StepCommand frees them.
         for request in scheduler_output.preempted_requests:

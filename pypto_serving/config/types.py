@@ -146,6 +146,13 @@ class RuntimeConfig:
     npu_memory_utilization: float = 0.90
     # Max tokens processed per scheduling step (chunked-prefill granularity).
     max_num_batched_tokens: int = 4096
+    # Optional model/kernel limit for one request's active prefill tokens in a
+    # single dispatch. ``None`` means the model has no stricter per-request
+    # limit than ``max_num_batched_tokens``.
+    max_prefill_tokens_per_request: int | None = None
+    # Whether speculative decoding can safely consume a prompt produced by
+    # more than one prefill dispatch.
+    supports_chunked_prefill_with_speculation: bool = True
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
     # Extra cache positions and execution tokens reserved for speculative decode.

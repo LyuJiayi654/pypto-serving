@@ -300,8 +300,11 @@ def _build_runtime_config(
         kv_dtype = args.dtype
 
     kv_cache_groups = ()
+    max_prefill_tokens_per_request = None
+    supports_chunked_prefill_with_speculation = True
     if model_family == "deepseek_v4":
         from pypto_serving.model.deepseek.npu_runner import (
+            DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
             build_deepseek_v4_cache_group_specs,
             deepseek_v4_decode_layout,
         )
@@ -319,6 +322,7 @@ def _build_runtime_config(
             enable_mtp=num_speculative_tokens == 1,
             max_seq_len=args.max_model_len,
         )
+        max_prefill_tokens_per_request = DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
 
     return RuntimeConfig(
         page_size=args.block_size,
@@ -329,6 +333,8 @@ def _build_runtime_config(
         weight_dtype=args.dtype,
         npu_memory_utilization=args.npu_memory_utilization,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_prefill_tokens_per_request=max_prefill_tokens_per_request,
+        supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,
     )
@@ -603,6 +609,29 @@ def run_serve(
     print(f"  Max running requests: {config.max_num_running_reqs}")
     print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
+    runtime = config.runtime_config
+    model_prefill_limit = (
+        runtime.max_prefill_tokens_per_request
+        if runtime is not None
+        else None
+    )
+    print(
+        "  Model prefill token limit: "
+        f"{model_prefill_limit if model_prefill_limit is not None else 'unlimited'}"
+    )
+    prefill_limits = [config.max_num_scheduled_tokens]
+    if config.enable_chunk_prefill and config.long_prefill_token_threshold > 0:
+        prefill_limits.append(config.long_prefill_token_threshold)
+    if model_prefill_limit is not None:
+        prefill_limits.append(model_prefill_limit)
+    print(f"  Effective prefill chunk size: {min(prefill_limits)}")
+    if runtime is not None and runtime.num_speculative_tokens > 0:
+        speculation_support = (
+            "supported"
+            if runtime.supports_chunked_prefill_with_speculation
+            else "unsupported"
+        )
+        print(f"  Chunked prefill with speculative decoding: {speculation_support}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
     endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health"

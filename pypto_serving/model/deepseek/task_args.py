@@ -25,6 +25,7 @@ kernel's positional contract -- this module is their single source of truth
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,6 +35,7 @@ from pypto_serving.model.common.runner.buffer_set import (
     Placement,
     Slot,
     StaticDeviceTensor,
+    copy_shared,
 )
 from pypto_serving.model.common.runner.task_args import TaskArgs
 from pypto_serving.model.deepseek.npu_runner import (
@@ -47,6 +49,7 @@ if TYPE_CHECKING:
     from pypto_serving.model.deepseek.npu_runner import DeepSeekV4ModelRunner
 
 __all__ = [
+    "DeepSeekPrefillTaskArgs",
     "decode_task_args",
     "mtp_decode_task_args",
     "mtp_prefill_task_args",
@@ -150,10 +153,24 @@ _PREFILL_FWD_TENSOR_ORDER = (
     "logit_row_indices",
 )
 
-# Argument order for the packed all-43-layer ``l3_decode_fwd`` kernel. This
-# mirrors pypto-lib decode_fwd.py ``l3_decode_fwd`` host signature: after the
-# ``hc_head`` collapse weights the kernel performs final RMSNorm and device
-# LM-head projection.
+_PREFILL_DYNAMIC_INPUT_NAMES = frozenset(
+    {
+        "x_hc",
+        "ori_slot_mapping",
+        "position_ids",
+        "input_ids",
+        "hca_cmp_slot_mapping",
+        "hca_state_slot_mapping",
+        "csa_cmp_slot_mapping",
+        "csa_idx_slot_mapping",
+        "csa_state_slot_mapping",
+        "csa_inner_state_slot_mapping",
+    }
+)
+_PREFILL_DYNAMIC_ARG_NAMES = _PREFILL_DYNAMIC_INPUT_NAMES | {"hidden_out"}
+
+# Argument order shared by the current standalone and fused main-decode ABIs.
+# Both entries consume the raw preamble inputs and the split HCA/CSA metadata.
 _DECODE_FWD_TENSOR_ORDER = (
     "embed_weight",
     "hc_attn_fn",
@@ -256,7 +273,7 @@ _MTP_PREFILL_TENSOR_ORDER = (
     "lm_head_weight", "hidden_out", "pre_hc_hidden_out", "logits", "logit_row_indices",
 )
 
-_MTP_DECODE_TENSOR_ORDER = (
+_FUSED_MTP_BASE_TENSOR_ORDER = (
     "embed_weight", "main_pre_hc_hidden", "tail_pre_hc_pool",
     "accepted_counts", "tail_slot_ids", "position_ids",
     "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
@@ -275,12 +292,33 @@ _MTP_DECODE_TENSOR_ORDER = (
     "logit_row_indices",
 )
 
-# The fused K=1 kernel owns persistent draft state, while the standalone MTP
-# kernel used to build additional K>1 drafts keeps the original stateless ABI.
+# PR985 body-only standalone MTP ABI. Embedding lookup, previous-hidden packing,
+# and SWA metadata lowering are performed by serving before the dispatch.
+_MTP_DECODE_TENSOR_ORDER = (
+    "hidden_states", "prev_pre_hc_hidden", "position_ids",
+    "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "kv_cache",
+    "swa_slot_mapping", "swa_indices", "swa_lens",
+    "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+    "gate_w", "gate_bias", "tid2eid", "input_ids",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
+    "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
+    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
+    "logit_row_indices",
+)
+
+# The K=1 fused entry kept the old raw-preamble MTP ABI and adds persistent
+# device state after the tail-slot metadata.
 _FUSED_MTP_DECODE_TENSOR_ORDER = (
-    *_MTP_DECODE_TENSOR_ORDER[:5],
+    *_FUSED_MTP_BASE_TENSOR_ORDER[:5],
     "state_generations", "state_tokens", "state_meta",
-    *_MTP_DECODE_TENSOR_ORDER[5:],
+    *_FUSED_MTP_BASE_TENSOR_ORDER[5:],
 )
 
 _FUSED_MTP_SHARED_TENSORS = frozenset(
@@ -322,6 +360,75 @@ _PREFILL_CACHE_POOLS = (
 )
 
 
+class DeepSeekPrefillTaskArgs(TaskArgs):
+    """Task arguments whose token-shaped slots use the active prefill extent."""
+
+    def __init__(self, ranks: int) -> None:
+        super().__init__(stacked=True)
+        self._ranks = int(ranks)
+        if self._ranks <= 0:
+            raise ValueError("DeepSeekV4 prefill ranks must be positive")
+
+    def token_view(self, name: str, kernel_tokens: int) -> torch.Tensor:
+        """Return a packed active-token view over one full-capacity shared slot."""
+        storage = self.tensors[name]
+        if not isinstance(storage, torch.Tensor):
+            raise TypeError(f"DeepSeekV4 prefill slot {name!r} is not a Host tensor")
+        if storage.ndim < 2 or int(storage.shape[0]) != self._ranks:
+            raise ValueError(
+                "DeepSeekV4 prefill storage must start with "
+                f"[{self._ranks}, capacity], got {name} shape={tuple(storage.shape)}"
+            )
+        if not storage.is_contiguous():
+            raise ValueError(f"DeepSeekV4 prefill storage {name!r} must be contiguous")
+
+        kernel_tokens = int(kernel_tokens)
+        capacity = int(storage.shape[1])
+        if kernel_tokens <= 0 or kernel_tokens > capacity:
+            raise ValueError(
+                f"DeepSeekV4 prefill extent {kernel_tokens} exceeds shared capacity {capacity}"
+            )
+        tail_shape = tuple(int(dim) for dim in storage.shape[2:])
+        used_elements = self._ranks * kernel_tokens * math.prod(tail_shape)
+        return storage.reshape(-1)[:used_elements].view(
+            self._ranks,
+            kernel_tokens,
+            *tail_shape,
+        )
+
+    def stage_for_tokens(
+        self,
+        inputs: dict[str, torch.Tensor],
+        kernel_tokens: int,
+    ) -> None:
+        """Stage fixed inputs normally and pack token-shaped inputs contiguously."""
+        fixed_inputs = {
+            name: tensor
+            for name, tensor in inputs.items()
+            if name not in _PREFILL_DYNAMIC_INPUT_NAMES
+        }
+        self.stage(fixed_inputs)
+        for name in _PREFILL_DYNAMIC_INPUT_NAMES:
+            tensor = inputs.get(name)
+            if tensor is None:
+                continue
+            copy_shared(
+                self.token_view(name, kernel_tokens),
+                tensor,
+                name=f"prefill_fwd_{name}",
+            )
+
+    def build_for_tokens(self, kernel_tokens: int) -> tuple[object, ...]:
+        """Build the kernel tuple with active views for token-shaped arguments."""
+        args = self.build()
+        return tuple(
+            self.token_view(name, kernel_tokens)
+            if name in _PREFILL_DYNAMIC_ARG_NAMES
+            else arg
+            for name, arg in zip(self.names, args, strict=True)
+        )
+
+
 def _static_weight_source(runner: DeepSeekV4ModelRunner, name: str):
     """Return a zero-arg source producing an upload-once ``StaticDeviceTensor``.
 
@@ -343,11 +450,17 @@ def _static_weight_source(runner: DeepSeekV4ModelRunner, name: str):
 
 
 def _prefill_slot_specs(
-    layout, hidden: int, vocab: int
+    layout,
+    hidden: int,
+    vocab: int,
+    *,
+    token_capacity: int | None = None,
 ) -> dict[str, tuple[torch.dtype, tuple[int, ...], ClearPolicy]]:
     """Host-shared slot name -> (dtype, full shape, clear policy) for the packed prefill dispatch."""
     ranks = layout.ranks
-    seq = layout.prefill_seq
+    seq = layout.prefill_seq if token_capacity is None else int(token_capacity)
+    if seq <= 0:
+        raise ValueError("DeepSeekV4 prefill token capacity must be positive")
     hc_mult = layout.hc_mult
     zero = ClearPolicy.ZERO
     return {
@@ -382,14 +495,29 @@ def _prefill_slot_specs(
         "csa_inner_state_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
         "num_tokens_per_owner": (torch.int32, (ranks,), ClearPolicy.NONE),
         "logit_row_indices": (torch.int32, (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS), ClearPolicy.NONE),
-        # outputs (zeroed before each prefill dispatch)
-        "pre_hc_hidden_out": (torch.float32, (ranks, seq, hc_mult, hidden), zero),
-        "hidden_out": (torch.bfloat16, (ranks, seq, hidden), zero),
+        # Outputs read back by the host are zeroed before each dispatch. The
+        # kernel overwrites the active hidden_out extent, so clearing its full
+        # max-sequence backing would add a large, unnecessary host memset.
+        # The main kernel exposes the final 128 valid pre-HC rows per owner.
+        "pre_hc_hidden_out": (
+            torch.float32,
+            (ranks, layout.prefill_seq, hc_mult, hidden),
+            zero,
+        ),
+        "hidden_out": (
+            torch.bfloat16,
+            (ranks, seq, hidden),
+            ClearPolicy.NONE,
+        ),
         "logits": (torch.float32, (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, vocab), zero),
     }
 
 
-def prefill_task_args(runner: DeepSeekV4ModelRunner, hidden: int, vocab: int) -> TaskArgs:
+def prefill_task_args(
+    runner: DeepSeekV4ModelRunner,
+    hidden: int,
+    vocab: int,
+) -> DeepSeekPrefillTaskArgs:
     """Build the ``TaskArgs`` for the single packed ``l3_prefill_fwd`` dispatch.
 
     Args are registered in ``_PREFILL_FWD_TENSOR_ORDER`` (the kernel's positional
@@ -399,11 +527,16 @@ def prefill_task_args(runner: DeepSeekV4ModelRunner, hidden: int, vocab: int) ->
     ``build()`` time (post-fork, post-resident-upload).
     """
     layout = runner._compiled.layout
-    slot_specs = _prefill_slot_specs(layout, hidden, vocab)
+    slot_specs = _prefill_slot_specs(
+        layout,
+        hidden,
+        vocab,
+        token_capacity=runner._prefill_buffer_tokens(),
+    )
     static_weights = set(_PREFILL_STATIC_WEIGHTS)
     cache_pools = set(_PREFILL_CACHE_POOLS)
 
-    ta = TaskArgs(stacked=True)
+    ta = DeepSeekPrefillTaskArgs(layout.ranks)
     for name in _PREFILL_FWD_TENSOR_ORDER:
         if name in slot_specs:
             dtype, shape, clear = slot_specs[name]
@@ -483,7 +616,6 @@ def decode_task_args(
     slot_specs = _decode_slot_specs(layout, hidden, vocab)
     static_weights = set(_DECODE_STATIC_WEIGHTS)
     cache_pools = set(_DECODE_CACHE_POOLS)
-
     ta = TaskArgs(stacked=True)
     for name in _DECODE_FWD_TENSOR_ORDER:
         if runner._compiled.num_speculative_tokens == 1 and name in _DECODE_STATIC_METADATA_FIELDS:
@@ -607,10 +739,15 @@ def _mtp_decode_slots(layout, hidden: int) -> dict[str, tuple[torch.dtype, tuple
     batch = layout.decode_batch
     tokens = layout.decode_tokens
     return {
+        "hidden_states": (torch.bfloat16, (ranks, tokens, hidden)),
+        "prev_pre_hc_hidden": (torch.float32, (ranks, tokens, layout.hc_mult, hidden)),
         "accepted_counts": (torch.int32, (ranks, batch)),
         "tail_slot_ids": (torch.int32, (ranks, batch)),
         "state_generations": (torch.int32, (ranks, batch)),
         "position_ids": (torch.int32, (ranks, tokens)),
+        "swa_slot_mapping": (torch.int64, (ranks, tokens)),
+        "swa_indices": (torch.int32, (ranks, tokens, layout.sliding_window)),
+        "swa_lens": (torch.int32, (ranks, tokens)),
         "input_ids": (torch.int64, (ranks, tokens)),
         "sampled_ids": (torch.int32, (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD)),
         "logit_row_indices": (torch.int32, (ranks, tokens)),
@@ -628,22 +765,23 @@ def mtp_decode_task_args(
 ) -> TaskArgs:
     """Build the ``TaskArgs`` for the single packed ``l3_mtp_decode`` dispatch.
 
-    One per ping-pong slot (the runner keeps a list of 2). The fused K=1 path
-    keeps write-only hidden/logits outputs device-resident, while the standalone
-    arbitrary-depth path retains host slots for its recurrent readback. Static
-    weights become upload-once markers, the MTP kv_cache / tail pool / recurrent
-    state and the strip-shared main-decode handles are lazy sources resolved at
-    ``build()``. Registered in the full fused order
-    (``_FUSED_MTP_DECODE_TENSOR_ORDER``) so the standalone arbitrary-depth path
-    can drop the three device-state args (``state_generations`` /
-    ``state_tokens`` / ``state_meta``) at build time.
+    One per ping-pong slot (the runner keeps a list of 2). K=1 registers the
+    fused raw-preamble ABI, keeps write-only outputs device-resident, and uses
+    persistent device state. K>1 registers the standalone body-only ABI and
+    retains host slots for recurrent readback. Static weights, cache pools, and
+    recurrent state are resolved lazily at ``build()``.
     """
     layout = runner._compiled.layout
     slots = _mtp_decode_slots(layout, hidden)
     static_weights = set(_MTP_DECODE_STATIC_WEIGHTS)
+    tensor_order = (
+        _FUSED_MTP_DECODE_TENSOR_ORDER
+        if runner._compiled.num_speculative_tokens == 1
+        else _MTP_DECODE_TENSOR_ORDER
+    )
 
     ta = TaskArgs(stacked=True)
-    for name in _FUSED_MTP_DECODE_TENSOR_ORDER:
+    for name in tensor_order:
         if name in slots:
             dtype, shape = slots[name]
             resident_outputs = {

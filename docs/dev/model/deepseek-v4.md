@@ -100,6 +100,19 @@ respectively. Non-MTP decode retains B8S1T8. The deprecated
 `--num-speculative-tokens K` and `--enable-mtp`
 flags remain compatibility aliases; `--enable-mtp` selects K=1.
 
+The main prefill kernel supports a dynamic request extent up to 8192 tokens and
+walks it internally in 128-token tiles. AR and MTP use the same main-prefill
+request limit; the effective dispatch extent is the minimum of 8192,
+`--max-num-batched-tokens`, `--long-prefill-token-threshold`, and
+`--max-model-len`. AR and MTP submit each main-prefill chunk once, with its
+backing extent padded to the next 128-token tile. Thus an 8191-token prompt uses
+one 8192-row main-prefill dispatch when those configured limits permit it,
+rather than 64 separate serving dispatches. The 128-token width is an internal
+kernel tile, not a serving chunk restriction. The main kernel returns each
+owner's final 128 valid pre-HC rows, which the standalone fixed-width MTP prefill
+kernel uses to rebuild its 127-row KV window before retaining the final row for
+sampling.
+
 For repeated launches, set `PYPTO_PROG_BUILD_DIR` to a persistent directory and
 add `--use-compile-cache`. The first launch populates a device-specific worker
 subdirectory after executable assembly. Later launches reuse the compiled
