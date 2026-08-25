@@ -15,7 +15,11 @@ import pytest
 import torch
 
 from pypto_serving.model.common.weights.packer import pack_globals, pad_rows
-from pypto_serving.model.common.weights.pipeline import StagingPolicy, stage_and_release, stage_layers
+from pypto_serving.model.common.weights.pipeline import (
+    StagingPolicy,
+    stage_and_release,
+    stage_layers,
+)
 from pypto_serving.model.common.weights.spec import GlobalWeightRule
 
 
@@ -65,7 +69,11 @@ class TestGlobalWeightRules:
         """
         head = torch.stack([torch.full((2,), 5.0), torch.full((2,), 7.0), torch.full((2,), 9.0)])
         rule = GlobalWeightRule(
-            "lm_head", "lm_head.weight", torch.float32, pad_to_multiple=4, pad_fill="first_row"
+            "lm_head",
+            "lm_head.weight",
+            torch.float32,
+            pad_to_multiple=4,
+            pad_fill="first_row",
         )
 
         packed = pack_globals([rule], {"lm_head.weight": head})
@@ -174,6 +182,42 @@ class TestStagingPolicy:
 
         assert torch.get_num_threads() == before
 
+    def test_thread_pinning_touches_process_state_once_around_the_pool(self, monkeypatch):
+        """Pinning must be set once around the pool, not saved and restored per worker.
+
+        `torch.set_num_threads` is process-wide, so a per-worker save/restore races with
+        itself: worker A saves 4 and sets 1, worker B then saves *1*, A restores 4, and B --
+        finishing last -- restores 1, leaving the serving process single-threaded for
+        everything after staging.
+
+        The interleaving that does it cannot be forced from `stage`, because each worker reads
+        the count before its callback runs; a test built on events inside `stage` passes on the
+        broken code too. So this asserts the protocol instead: exactly one pin and one restore
+        for the whole pool, whatever the worker count.
+        """
+        real_get = torch.get_num_threads
+        sets: list[int] = []
+        monkeypatch.setattr(torch, "set_num_threads", sets.append)
+
+        stage_layers([0, 1, 2, 3], stage=lambda _: None, policy=StagingPolicy(workers=2))
+
+        assert sets == [1, real_get()]
+
+    def test_pinning_is_restored_even_when_a_layer_raises(self):
+        """A staging failure must not leave the process pinned to one thread."""
+        before = torch.get_num_threads()
+        torch.set_num_threads(4)
+        try:
+            with pytest.raises(RuntimeError, match="boom"):
+                stage_layers(
+                    [0, 1],
+                    stage=lambda _: (_ for _ in ()).throw(RuntimeError("boom")),
+                    policy=StagingPolicy(workers=2),
+                )
+            assert torch.get_num_threads() == 4
+        finally:
+            torch.set_num_threads(before)
+
     def test_zero_workers_is_refused(self):
         with pytest.raises(ValueError, match="at least one worker"):
             StagingPolicy(workers=0)
@@ -181,7 +225,12 @@ class TestStagingPolicy:
     def test_on_layer_done_fires_once_per_layer(self):
         done: list[int] = []
 
-        stage_layers([0, 1, 2], stage=lambda _: None, policy=StagingPolicy(workers=1), on_layer_done=done.append)
+        stage_layers(
+            [0, 1, 2],
+            stage=lambda _: None,
+            policy=StagingPolicy(workers=1),
+            on_layer_done=done.append,
+        )
 
         assert done == [0, 1, 2]
 
@@ -220,7 +269,10 @@ class TestStageAndRelease:
             return {"w": tensor}
 
         stage_and_release(
-            [0, 1, 2], load=_load, write=lambda *_: None, policy=StagingPolicy(workers=1)
+            [0, 1, 2],
+            load=_load,
+            write=lambda *_: None,
+            policy=StagingPolicy(workers=1),
         )
         gc.collect()
 

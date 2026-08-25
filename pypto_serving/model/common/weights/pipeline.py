@@ -71,21 +71,24 @@ def stage_layers(
         return
 
     def _run(layer_id: int) -> int:
-        if policy.pin_torch_threads:
-            previous = torch.get_num_threads()
-            torch.set_num_threads(1)
-            try:
-                stage(int(layer_id))
-            finally:
-                torch.set_num_threads(previous)
-        else:
-            stage(int(layer_id))
+        stage(int(layer_id))
         return int(layer_id)
 
-    with ThreadPoolExecutor(max_workers=min(policy.workers, len(layer_ids))) as pool:
-        for layer_id in pool.map(_run, [int(layer_id) for layer_id in layer_ids]):
-            if on_layer_done is not None:
-                on_layer_done(layer_id)
+    # `torch.set_num_threads` is process-wide, so this is set once around the whole pool and
+    # not per worker. Saving and restoring it inside `_run` races with itself: worker A saves
+    # 8 and sets 1, worker B then saves *1*, A restores 8, and B finally restores 1 — leaving
+    # the serving process single-threaded for everything that follows staging.
+    previous_threads = torch.get_num_threads() if policy.pin_torch_threads else None
+    if previous_threads is not None:
+        torch.set_num_threads(1)
+    try:
+        with ThreadPoolExecutor(max_workers=min(policy.workers, len(layer_ids))) as pool:
+            for layer_id in pool.map(_run, [int(layer_id) for layer_id in layer_ids]):
+                if on_layer_done is not None:
+                    on_layer_done(layer_id)
+    finally:
+        if previous_threads is not None:
+            torch.set_num_threads(previous_threads)
 
 
 def stage_and_release(
