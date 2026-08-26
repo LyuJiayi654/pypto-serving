@@ -174,23 +174,6 @@ class LayerSpec:
 
 
 @dataclass
-class LayerWeights:
-    """Loaded weights for one transformer layer in framework orientation."""
-
-    input_rms_weight: torch.Tensor
-    wq: torch.Tensor
-    wk: torch.Tensor
-    wv: torch.Tensor
-    q_norm_weight: torch.Tensor
-    k_norm_weight: torch.Tensor
-    wo: torch.Tensor
-    post_rms_weight: torch.Tensor
-    w_gate: torch.Tensor
-    w_up: torch.Tensor
-    w_down: torch.Tensor
-
-
-@dataclass
 class RuntimeModel:
     """Loaded model tensors plus runtime and architecture metadata."""
 
@@ -199,7 +182,6 @@ class RuntimeModel:
     embed_tokens: torch.Tensor
     final_norm_weight: torch.Tensor
     lm_head: torch.Tensor
-    layers: list[LayerWeights]
     extra: dict[str, object] = field(default_factory=dict)
 
 

@@ -19,7 +19,6 @@ import torch
 from .tokenizer import TokenizerAdapter, load_tokenizer
 from pypto_serving.config.types import (
     LayerSpec,
-    LayerWeights,
     LoadedModel,
     ModelConfig,
     RuntimeConfig,
@@ -72,6 +71,35 @@ class ModelFormatLoader(Protocol):
         raise NotImplementedError
 
 
+class SafetensorsDirectoryLoader:
+    """Shared behaviour for loaders that read a local safetensors checkpoint directory.
+
+    Only what is genuinely common lives here. Format matching is identical for every such
+    loader, and every one needs a `config.json` before any of its own checks can mean anything,
+    so `can_load` splits into that precondition plus a family-specific `_recognises` hook.
+
+    `load` is deliberately not here: the two families produce different things from a
+    directory — one stages layers lazily from a Hugging Face tree, the other validates a
+    quantized checkpoint contract — and a shared skeleton would be a hook for every step.
+    """
+
+    format_names: tuple[str, ...] = ()
+
+    def supports_format(self, model_format: str) -> bool:
+        """Return whether ``model_format`` names this loader."""
+        return model_format.lower() in self.format_names
+
+    def can_load(self, model_path: Path) -> bool:
+        """Return whether this loader recognises *model_path*."""
+        if not (model_path / "config.json").exists():
+            return False
+        return self._recognises(model_path)
+
+    def _recognises(self, model_path: Path) -> bool:
+        """Family-specific detection, given that ``config.json`` exists."""
+        raise NotImplementedError
+
+
 def _load_safetensors_weight_map(model_dir: Path) -> dict[str, str]:
     """Return the ``{tensor_name: shard_filename}`` map from a safetensors index.
 
@@ -107,18 +135,36 @@ def _safetensors_shard_filenames(weight_map: dict[str, str]) -> list[str]:
     return sorted(set(weight_map.values()))
 
 
-def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
-    """Load all safetensors shards from a local Hugging Face directory."""
+def _load_safetensors_subset(
+    model_dir: Path,
+    weight_map: dict[str, str],
+    names: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """Load only *names*, opening each shard once and skipping absent optional weights.
+
+    Reads through `safe_open` rather than `load_file` so a shard contributes only the tensors
+    asked for: the point of this path is that the checkpoint is never fully resident, and
+    `load_file` would materialize a whole shard to reach one tensor in it.
+    """
     try:
-        from safetensors.torch import load_file
+        from safetensors import safe_open
     except ImportError as exc:
         raise RuntimeError("safetensors is required to load weights from a local model directory.") from exc
 
-    weight_map = _load_safetensors_weight_map(model_dir)
-    filenames = _safetensors_shard_filenames(weight_map)
+    wanted: dict[str, list[str]] = {}
+    for name in names:
+        filename = weight_map.get(name)
+        if filename is None:
+            # Optional weights (a tied `lm_head`, an alternative final-norm name) are absent by
+            # design; the caller decides what a missing one means.
+            continue
+        wanted.setdefault(filename, []).append(name)
+
     state_dict: dict[str, torch.Tensor] = {}
-    for filename in filenames:
-        state_dict.update(load_file(str(model_dir / filename)))
+    for filename, shard_names in wanted.items():
+        with safe_open(str(model_dir / filename), framework="pt", device="cpu") as reader:
+            for name in shard_names:
+                state_dict[name] = reader.get_tensor(name)
     return state_dict
 
 
@@ -184,25 +230,16 @@ def _cast_weight(weight: torch.Tensor, runtime: RuntimeConfig) -> torch.Tensor:
     return weight.to(device=runtime.device, dtype=dtype)
 
 
-class HuggingFaceDirectoryLoader:
+class HuggingFaceDirectoryLoader(SafetensorsDirectoryLoader):
     """Loader for local Hugging Face-style decoder model directories."""
 
     format_names = ("huggingface", "hf")
 
-    def supports_format(self, model_format: str) -> bool:
-        """Return whether ``model_format`` names the Hugging Face loader."""
-        return model_format.lower() in self.format_names
-
-    def can_load(self, model_path: Path) -> bool:
-        """Detect a local directory with config and safetensors weights."""
-        config_path = model_path / "config.json"
-        if not config_path.exists():
-            return False
+    def _recognises(self, model_path: Path) -> bool:
+        """Accept any directory carrying safetensors weights, indexed or single-shard."""
         if (model_path / "model.safetensors.index.json").exists():
             return True
-        if any(model_path.glob("*.safetensors")):
-            return True
-        return False
+        return any(model_path.glob("*.safetensors"))
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
         """Load a supported Hugging Face directory into runtime tensors."""
@@ -217,7 +254,20 @@ class HuggingFaceDirectoryLoader:
         config = _build_model_config(request.model_id, config_data, tokenizer)
         runtime = request.runtime_config or RuntimeConfig(max_seq_len=config.max_position_embeddings)
         layer_specs = _build_layer_specs(config)
-        state_dict = _load_safetensors_dir(model_path)
+        weight_map = _load_safetensors_weight_map(model_path)
+        # Metadata plus the globals only. `embed_tokens` has to stay resident because
+        # `Executor.lookup_embeddings` reads it at request time; the other two are one tensor
+        # each. Every per-layer tensor is read later, while it is staged.
+        state_dict = _load_safetensors_subset(
+            model_path,
+            weight_map,
+            (
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "model.final_layernorm.weight",
+                "lm_head.weight",
+            ),
+        )
 
         if config.architecture.lower() not in {"qwen2forcausallm", "qwen3forcausallm", "qwen2model", "qwen3model"}:
             raise ValueError(
@@ -236,46 +286,16 @@ class HuggingFaceDirectoryLoader:
         else:
             lm_head = _cast_weight(lm_head, runtime)
 
-        layers: list[LayerWeights] = []
-        default_dtype = _torch_dtype_from_name(runtime.weight_dtype)
-        for spec in layer_specs:
-            prefix = f"model.layers.{spec.layer_idx}"
-            q_norm = _optional_tensor(state_dict, [f"{prefix}.self_attn.q_norm.weight"])
-            k_norm = _optional_tensor(state_dict, [f"{prefix}.self_attn.k_norm.weight"])
-            if q_norm is None:
-                q_norm = torch.ones(spec.head_dim, device=runtime.device, dtype=default_dtype)
-            else:
-                q_norm = _cast_weight(q_norm, runtime)
-            if k_norm is None:
-                k_norm = torch.ones(spec.head_dim, device=runtime.device, dtype=default_dtype)
-            else:
-                k_norm = _cast_weight(k_norm, runtime)
-            layers.append(
-                LayerWeights(
-                    input_rms_weight=_cast_weight(_require_tensor(state_dict, f"{prefix}.input_layernorm.weight"), runtime),
-                    wq=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.q_proj.weight"), runtime),
-                    wk=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.k_proj.weight"), runtime),
-                    wv=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.v_proj.weight"), runtime),
-                    q_norm_weight=q_norm,
-                    k_norm_weight=k_norm,
-                    wo=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.o_proj.weight"), runtime),
-                    post_rms_weight=_cast_weight(
-                        _require_tensor(state_dict, f"{prefix}.post_attention_layernorm.weight"),
-                        runtime,
-                    ),
-                    w_gate=_cast_weight(_require_tensor(state_dict, f"{prefix}.mlp.gate_proj.weight"), runtime),
-                    w_up=_cast_weight(_require_tensor(state_dict, f"{prefix}.mlp.up_proj.weight"), runtime),
-                    w_down=_cast_weight(_require_tensor(state_dict, f"{prefix}.mlp.down_proj.weight"), runtime),
-                )
-            )
-
         runtime_model = RuntimeModel(
             config=config,
             runtime=runtime,
             embed_tokens=embed_tokens,
             final_norm_weight=final_norm_weight,
             lm_head=lm_head,
-            layers=layers,
+            # `layers` is left at its default: the executor stages each layer as it reads it,
+            # through the metadata below. Populating it eagerly cost a second copy of the model
+            # at the staging peak.
+            extra={"model_dir": str(model_path), "weight_map": weight_map},
         )
 
         return LoadedModel(
@@ -288,23 +308,22 @@ class HuggingFaceDirectoryLoader:
         )
 
 
-class DeepSeekV4W8A8DirectoryLoader:
+class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
     """Lazy loader for the local DeepSeekV4 Flash W8A8 checkpoint."""
 
     format_names = ("deepseek_v4_w8a8", "deepseek-v4-w8a8", "dsv4-w8a8")
 
-    def supports_format(self, model_format: str) -> bool:
-        """Return whether ``model_format`` names the DeepSeekV4 W8A8 loader."""
-        return model_format.lower() in self.format_names
+    def _recognises(self, model_path: Path) -> bool:
+        """Require a shard index and a config that names DeepSeekV4.
 
-    def can_load(self, model_path: Path) -> bool:
-        """Detect a DeepSeekV4 compressed-tensors checkpoint directory."""
-        config_path = model_path / "config.json"
-        index_path = model_path / "model.safetensors.index.json"
-        if not config_path.exists() or not index_path.exists():
+        Stricter than the Hugging Face loader on purpose: this one only claims a directory it
+        can actually serve, so an unreadable config is a "no" rather than an error — the
+        registry goes on to ask the next loader.
+        """
+        if not (model_path / "model.safetensors.index.json").exists():
             return False
         try:
-            config_data = json.loads(config_path.read_text())
+            config_data = json.loads((model_path / "config.json").read_text())
         except json.JSONDecodeError:
             return False
         return _is_deepseek_v4_config(config_data)
@@ -344,7 +363,6 @@ class DeepSeekV4W8A8DirectoryLoader:
             embed_tokens=placeholder,
             final_norm_weight=torch.empty(0, dtype=torch.bfloat16),
             lm_head=placeholder,
-            layers=[],
             extra={
                 "family": "deepseek_v4",
                 "checkpoint_format": "w8a8-compressed-tensors",

@@ -20,28 +20,20 @@ import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ContextManager, Protocol
+from typing import ContextManager
 
 import numpy as np
 import torch
 
+from pypto_serving.model.common.weights.store import LazySafetensorsStore, SafeOpenFn, SafeTensorReader
+
 logger = logging.getLogger(__name__)
 
 
-class _SafeTensorReader(Protocol):
-    """Minimal safetensors reader protocol used by the lazy weight store."""
-
-    def get_tensor(self, name: str) -> torch.Tensor:
-        """Return one tensor by name."""
-        raise NotImplementedError
-
-
-class _SafeOpenFn(Protocol):
-    """Callable shape for injectable safetensors openers."""
-
-    def __call__(self, path: Path, device: str) -> ContextManager[_SafeTensorReader]:
-        """Open one safetensors shard."""
-        raise NotImplementedError
+# The reader/opener shapes are family-neutral and now live with the shared store; the
+# private aliases stay so this module's annotations and its callers read unchanged.
+_SafeTensorReader = SafeTensorReader
+_SafeOpenFn = SafeOpenFn
 
 
 _GLOBAL_WEIGHT_NAMES = (
@@ -616,45 +608,23 @@ def deepseek_v4_mtp_startup_weight_names(n_routed_experts: int) -> tuple[str, ..
     return tuple(dict.fromkeys((*layer_names, *projection_and_head)))
 
 
-class DeepSeekV4WeightStore:
-    """Lazy name-based safetensors access for DeepSeekV4 W8A8 checkpoints."""
+class DeepSeekV4WeightStore(LazySafetensorsStore):
+    """Lazy name-based safetensors access for DeepSeekV4 W8A8 checkpoints.
 
-    def __init__(
-        self,
-        *,
-        model_dir: str | Path,
-        weight_map: Mapping[str, str],
-        device: str = "cpu",
-        safe_open_fn: _SafeOpenFn | None = None,
-    ) -> None:
-        """Create a store from the Hugging Face safetensors index."""
-        self.model_dir = Path(model_dir)
-        self.weight_map = dict(weight_map)
-        self.device = device
-        self._safe_open_fn = _default_safe_open if safe_open_fn is None else safe_open_fn
+    The index handling and the grouped reads come from
+    :class:`~pypto_serving.model.common.weights.store.LazySafetensorsStore`; what stays
+    here is the DeepSeekV4 contract — which names a checkpoint must expose, and how the
+    global and per-layer tensors are packed for the fused kernels.
+    """
 
-    def __contains__(self, name: object) -> bool:
-        """Return whether the checkpoint index exposes ``name``."""
-        return isinstance(name, str) and name in self.weight_map
+    missing_name_error = "Missing DeepSeekV4 weight tensor in index: {name}"
+    missing_names_error = "DeepSeekV4 W8A8 checkpoint is missing required tensors: {names}"
+    missing_shard_error = "Missing safetensors shard for DeepSeekV4 weight load: {path}"
 
-    def filename_for(self, name: str) -> str:
-        """Return the safetensors shard filename for ``name``."""
-        try:
-            return self.weight_map[name]
-        except KeyError as exc:
-            raise KeyError(f"Missing DeepSeekV4 weight tensor in index: {name}") from exc
-
-    def path_for(self, name: str) -> Path:
-        """Return the shard path containing ``name``."""
-        return self.model_dir / self.filename_for(name)
-
-    def require(self, names: Iterable[str]) -> None:
-        """Validate that all tensor names are present in the checkpoint index."""
-        missing = [name for name in names if name not in self.weight_map]
-        if missing:
-            preview = ", ".join(missing[:8])
-            suffix = "" if len(missing) <= 8 else f", ... ({len(missing)} total)"
-            raise KeyError(f"DeepSeekV4 W8A8 checkpoint is missing required tensors: {preview}{suffix}")
+    def _default_open_fn(self) -> SafeOpenFn:
+        # Resolved through this module's global on purpose: the opener carries the
+        # DeepSeekV4-specific import diagnostic, and tests patch it by name here.
+        return _default_safe_open
 
     def validate_startup_contract(
         self,
@@ -677,30 +647,6 @@ class DeepSeekV4WeightStore:
     def validate_mtp_startup_contract(self, *, n_routed_experts: int) -> None:
         """Validate MTP metadata without opening checkpoint shards."""
         self.require(deepseek_v4_mtp_startup_weight_names(n_routed_experts))
-
-    def load_tensor(self, name: str) -> torch.Tensor:
-        """Load one tensor by name, leaving all unrelated shard tensors untouched."""
-        return self.load_many([name])[name]
-
-    def load_many(self, names: Sequence[str]) -> dict[str, torch.Tensor]:
-        """Load a set of named tensors grouped by shard file."""
-        unique_names = tuple(dict.fromkeys(names))
-        self.require(unique_names)
-
-        groups: dict[str, list[str]] = {}
-        for name in unique_names:
-            groups.setdefault(self.filename_for(name), []).append(name)
-
-        loaded: dict[str, torch.Tensor] = {}
-        for filename, shard_names in groups.items():
-            path = self.model_dir / filename
-            if not path.exists():
-                raise FileNotFoundError(f"Missing safetensors shard for DeepSeekV4 weight load: {path}")
-            with self._safe_open_fn(path, self.device) as reader:
-                for name in shard_names:
-                    loaded[name] = reader.get_tensor(name)
-
-        return {name: loaded[name] for name in unique_names}
 
     def load_global_weights(self) -> dict[str, torch.Tensor]:
         """Load embedding, final norm, and LM head tensors."""
@@ -987,40 +933,48 @@ class DeepSeekV4WeightStore:
             include_tid2eid=num_hash_layers > 0,
             include_gate_bias=num_hash_layers <= 0,
         )
-        stacked, fwd_names = _allocate_stacked_layer_weights(first, compress_ratios=compress_ratios)
-        csa_order = 0
-        hca_order = 0
-        for layer_id in range(num_hidden_layers):
-            compress_ratio = int(compress_ratios[layer_id])
-            destinations = _stacked_layer_destinations(
-                stacked,
-                first,
-                fwd_names=fwd_names,
-                layer_id=layer_id,
-                compress_ratio=compress_ratio,
-                csa_order=csa_order,
-                hca_order=hca_order,
+        from pypto_serving.model.common.weights.stacker import stack_layers  # noqa: PLC0415
+
+        from .weight_spec import (  # noqa: PLC0415
+            DEEPSEEK_V4_RANK_ERROR,
+            DEEPSEEK_V4_STACK_MISMATCH_ERROR,
+            DEEPSEEK_V4_STAGING_POLICY,
+            deepseek_v4_stack_groups,
+        )
+
+
+        def pack_into(layer_id: int, destinations: Mapping[str, torch.Tensor]) -> None:
+            self.load_packed_layer_weights(
+                layer_id,
+                ranks=ranks,
+                n_routed_experts=n_routed_experts,
+                compress_ratio=int(compress_ratios[layer_id]),
+                include_tid2eid=layer_id < num_hash_layers,
+                include_gate_bias=layer_id >= num_hash_layers,
+                destinations=destinations,
             )
-            if layer_id == 0:
-                _copy_packed_layer(first, destinations)
-            else:
-                self.load_packed_layer_weights(
-                    layer_id,
-                    ranks=ranks,
-                    n_routed_experts=n_routed_experts,
-                    compress_ratio=compress_ratio,
-                    include_tid2eid=layer_id < num_hash_layers,
-                    include_gate_bias=layer_id >= num_hash_layers,
-                    destinations=destinations,
-                )
+
+        def log_progress(layer_id: int) -> None:
+            # Every fifth layer plus the last, and layer 0 included: it takes the template path
+            # rather than pack_into, so logging there would drop the first line of progress.
             if layer_id % 5 == 0 or layer_id == num_hidden_layers - 1:
                 logger.info(
                     "DeepSeekV4 weight load progress: layer %d/%d",
                     layer_id + 1,
                     num_hidden_layers,
                 )
-            csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO)
-            hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO)
+
+        stacked = stack_layers(
+            deepseek_v4_stack_groups(compress_ratios),
+            first.tensors,
+            layer_ids=range(num_hidden_layers),
+            pack_into=pack_into,
+            template_layer_id=0,
+            on_layer_done=log_progress,
+            policy=DEEPSEEK_V4_STAGING_POLICY,
+            rank_error=DEEPSEEK_V4_RANK_ERROR,
+            mismatch_error=DEEPSEEK_V4_STACK_MISMATCH_ERROR,
+        )
         return DeepSeekV4StackedLayerWeights(tensors=stacked)
 
     def load_mtp_weights(
@@ -1064,125 +1018,27 @@ class DeepSeekV4WeightStore:
             prefix=prefix,
         )
 
-        def replicated(name: str, dtype: torch.dtype) -> torch.Tensor:
-            tensor = raw[f"{prefix}.{name}"].to(dtype=dtype).contiguous().cpu()
-            return tensor.unsqueeze(0).expand(ranks, *tensor.shape).contiguous()
+        from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
+        from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
 
-        tensors = dict(packed_layer.tensors)
-        tensors.update(
-            {
-                "enorm_w": replicated("enorm.weight", torch.float32),
-                "hnorm_w": replicated("hnorm.weight", torch.float32),
-                "e_proj_w": replicated("e_proj.weight", torch.int8),
-                "e_proj_w_scale": replicated("e_proj.scale", torch.float32),
-                "e_proj_smooth": torch.ones((ranks, _DEEPSEEK_V4_HIDDEN_SIZE), dtype=torch.float32),
-                "h_proj_w": replicated("h_proj.weight", torch.int8),
-                "h_proj_w_scale": replicated("h_proj.scale", torch.float32),
-                "h_proj_smooth": torch.ones((ranks, _DEEPSEEK_V4_HIDDEN_SIZE), dtype=torch.float32),
-                "mtp_hc_head_fn": replicated("hc_head_fn", torch.float32),
-                "mtp_hc_head_scale": replicated("hc_head_scale", torch.float32),
-                "mtp_hc_head_base": replicated("hc_head_base", torch.float32),
-                "mtp_norm_w": replicated("norm.weight", torch.bfloat16),
-            }
+        from .weight_spec import (  # noqa: PLC0415
+            DEEPSEEK_V4_MTP_EXTRA_RULES,
+            DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+            deepseek_v4_factories,
+            deepseek_v4_replicate,
         )
-        return DeepSeekV4MtpWeights(tensors=tensors)
 
-
-def _allocate_stacked_layer_weights(
-    template: DeepSeekV4PackedLayerWeights,
-    *,
-    compress_ratios: Sequence[int],
-) -> tuple[dict[str, torch.Tensor], tuple[str, ...]]:
-    csa_names = set(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES)
-    hca_names = set(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES)
-    fwd_names = tuple(name for name in template.tensors if name not in csa_names and name not in hca_names)
-    group_counts = (
-        (fwd_names, len(compress_ratios)),
-        (
-            DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES,
-            sum(int(ratio) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO for ratio in compress_ratios),
-        ),
-        (
-            DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES,
-            sum(int(ratio) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO for ratio in compress_ratios),
-        ),
-    )
-    stacked: dict[str, torch.Tensor] = {}
-    for names, count in group_counts:
-        if count == 0:
-            continue
-        for name in names:
-            source = template.tensors[name]
-            if source.ndim < 2:
-                raise ValueError(f"packed DeepSeekV4 weight {name} must have rank >= 2, got {source.ndim}")
-            shape = (int(source.shape[0]), count * int(source.shape[1]), *source.shape[2:])
-            stacked[name] = torch.empty(shape, dtype=source.dtype, device="cpu")
-    return stacked, fwd_names
-
-
-def _stacked_layer_destinations(
-    stacked: Mapping[str, torch.Tensor],
-    template: DeepSeekV4PackedLayerWeights,
-    *,
-    fwd_names: Sequence[str],
-    layer_id: int,
-    compress_ratio: int,
-    csa_order: int,
-    hca_order: int,
-) -> dict[str, torch.Tensor]:
-    destinations: dict[str, torch.Tensor] = {}
-
-    def add(names: Sequence[str], order: int) -> None:
-        for name in names:
-            width = int(template.tensors[name].shape[1])
-            destinations[name] = stacked[name][:, order * width : (order + 1) * width]
-
-    add(fwd_names, layer_id)
-    if compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO:
-        add(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES, csa_order)
-    elif compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO:
-        add(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES, hca_order)
-    return destinations
-
-
-def _copy_packed_layer(
-    packed: DeepSeekV4PackedLayerWeights,
-    destinations: Mapping[str, torch.Tensor],
-) -> None:
-    for name, destination in destinations.items():
-        source = packed.tensors[name]
-        if tuple(source.shape) != tuple(destination.shape) or source.dtype != destination.dtype:
-            raise ValueError(
-                f"packed DeepSeekV4 weight {name} shape/dtype mismatch: "
-                f"source={tuple(source.shape)}/{source.dtype}, "
-                f"destination={tuple(destination.shape)}/{destination.dtype}"
-            )
-        destination.copy_(source)
-
-
-def _replicate_weight(
-    name: str,
-    tensor: torch.Tensor,
-    *,
-    ranks: int,
-    dtype: torch.dtype | None,
-    destination: torch.Tensor | None,
-) -> torch.Tensor:
-    source = tensor.cpu() if tensor.device.type != "cpu" else tensor
-    output_dtype = source.dtype if dtype is None else dtype
-    expected_shape = (ranks, *source.shape)
-    if destination is not None:
-        if tuple(destination.shape) != expected_shape or destination.dtype != output_dtype:
-            raise ValueError(
-                f"packed DeepSeekV4 destination {name} shape/dtype mismatch: "
-                f"expected={expected_shape}/{output_dtype}, "
-                f"got={tuple(destination.shape)}/{destination.dtype}"
-            )
-        destination.copy_(source.unsqueeze(0))
-        return destination
-    if dtype is not None:
-        source = source.to(dtype=dtype)
-    return source.contiguous().unsqueeze(0).expand(ranks, *source.shape).contiguous()
+        # The draft layer's own weights, through the same evaluator: `LayerContext` already
+        # carries the prefix, so `mtp.0` needs no special case beyond this table.
+        extras = pack_layer(
+            DEEPSEEK_V4_MTP_EXTRA_RULES,
+            raw,
+            LayerContext(layer_id=0, prefix=prefix, ranks=int(ranks)),
+            policy=deepseek_v4_replicate(int(ranks)),
+            factories=deepseek_v4_factories(),
+            missing_source_error=DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+        )
+        return DeepSeekV4MtpWeights(tensors={**packed_layer.tensors, **extras})
 
 
 def pack_deepseek_v4_layer_weights(
@@ -1197,393 +1053,51 @@ def pack_deepseek_v4_layer_weights(
     destinations: Mapping[str, torch.Tensor] | None = None,
     prefix: str | None = None,
 ) -> DeepSeekV4PackedLayerWeights:
-    """Pack raw checkpoint tensors into new buffers or final-layout destinations."""
-    prefix = f"layers.{int(layer_id)}" if prefix is None else prefix
+    """Pack raw checkpoint tensors into new buffers or final-layout destinations.
 
-    def get(suffix: str) -> torch.Tensor:
-        name = f"{prefix}.{suffix}"
-        try:
-            return raw[name]
-        except KeyError as exc:
-            raise KeyError(f"missing raw DeepSeekV4 layer tensor: {name}") from exc
+    This is DeepSeekV4's binding to the generic evaluator, not a pass-through: it turns the
+    family's arguments into a :class:`LayerContext`, selects the rank and expert-placement
+    policies, supplies the synthetic-weight factories, and carries the two error templates its
+    callers' diagnostics are matched against. Both production callers
+    (:meth:`DeepSeekV4WeightStore.load_packed_layer_weights` and
+    :meth:`~DeepSeekV4WeightStore.load_mtp_weights`) would otherwise repeat that wiring, and
+    the MTP path would have to know to pass ``prefix="mtp.0"`` through it.
 
-    def replicated(
-        name: str,
-        tensor: torch.Tensor,
-        *,
-        dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-        destination = None if destinations is None else destinations[name]
-        return _replicate_weight(
-            name,
-            tensor,
-            ranks=ranks,
-            dtype=dtype,
-            destination=destination,
-        )
+    The rules themselves live in ``weight_spec.py``; what is here is the argument surface the
+    rest of the DeepSeekV4 code already calls.
+    """
+    from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
+    from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
 
-    def replicated_transposed(
-        name: str,
-        tensor: torch.Tensor,
-        *,
-        dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-        return replicated(name, tensor.transpose(0, 1), dtype=dtype)
-
-    tensors: dict[str, torch.Tensor] = {
-        "hc_attn_fn": replicated("hc_attn_fn", get("hc_attn_fn"), dtype=torch.float32),
-        "hc_attn_scale": replicated("hc_attn_scale", get("hc_attn_scale"), dtype=torch.float32),
-        "hc_attn_base": replicated("hc_attn_base", get("hc_attn_base"), dtype=torch.float32),
-        "attn_norm_w": replicated("attn_norm_w", get("attn_norm.weight"), dtype=torch.bfloat16),
-        "wq_a": replicated_transposed("wq_a", get("attn.wq_a.weight"), dtype=torch.bfloat16),
-        "wq_b": replicated_transposed("wq_b", get("attn.wq_b.weight"), dtype=torch.int8),
-        "wq_b_scale": replicated("wq_b_scale", get("attn.wq_b.scale"), dtype=torch.float32),
-        "wkv": replicated_transposed("wkv", get("attn.wkv.weight"), dtype=torch.bfloat16),
-        "gamma_cq": replicated("gamma_cq", get("attn.q_norm.weight"), dtype=torch.bfloat16),
-        "gamma_ckv": replicated("gamma_ckv", get("attn.kv_norm.weight"), dtype=torch.bfloat16),
-        "attn_sink": replicated("attn_sink", get("attn.attn_sink"), dtype=torch.float32),
-        "wo_a": replicated("wo_a", _pack_wo_a(get("attn.wo_a.weight")), dtype=torch.bfloat16),
-        "wo_b": replicated("wo_b", get("attn.wo_b.weight"), dtype=torch.int8),
-        "wo_b_scale": replicated("wo_b_scale", get("attn.wo_b.scale"), dtype=torch.float32),
-        "hc_ffn_fn": replicated("hc_ffn_fn", get("hc_ffn_fn"), dtype=torch.float32),
-        "hc_ffn_scale": replicated("hc_ffn_scale", get("hc_ffn_scale"), dtype=torch.float32),
-        "hc_ffn_base": replicated("hc_ffn_base", get("hc_ffn_base"), dtype=torch.float32),
-        "norm_w": replicated("norm_w", get("ffn_norm.weight"), dtype=torch.bfloat16),
-        "gate_w": replicated("gate_w", get("ffn.gate.weight"), dtype=torch.float32),
-        "shared_w1": replicated("shared_w1", get("ffn.shared_experts.w1.weight"), dtype=torch.int8),
-        "shared_w1_scale": replicated(
-            "shared_w1_scale", get("ffn.shared_experts.w1.scale"), dtype=torch.float32
-        ),
-        "shared_w3": replicated("shared_w3", get("ffn.shared_experts.w3.weight"), dtype=torch.int8),
-        "shared_w3_scale": replicated(
-            "shared_w3_scale", get("ffn.shared_experts.w3.scale"), dtype=torch.float32
-        ),
-        "shared_w2": replicated("shared_w2", get("ffn.shared_experts.w2.weight"), dtype=torch.int8),
-        "shared_w2_scale": replicated(
-            "shared_w2_scale", get("ffn.shared_experts.w2.scale"), dtype=torch.float32
-        ),
-    }
-
-    tensors.update(
-        _pack_deepseek_v4_optional_attention(
-            prefix,
-            raw,
-            ranks,
-            compress_ratio=compress_ratio,
-            destinations=destinations,
-        )
+    from .weight_spec import (  # noqa: PLC0415
+        DEEPSEEK_V4_EXPERT_MISSING_ERROR,
+        DEEPSEEK_V4_LAYER_RULES,
+        DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+        deepseek_v4_expert_parallel,
+        deepseek_v4_factories,
+        deepseek_v4_replicate,
     )
-    tensors.update(
-        _pack_deepseek_v4_router(
-            prefix,
-            raw,
-            ranks=ranks,
-            n_routed_experts=n_routed_experts,
-            include_tid2eid=include_tid2eid,
-            include_gate_bias=include_gate_bias,
-            destinations=destinations,
-        )
+
+    context = LayerContext(
+        layer_id=int(layer_id),
+        prefix=f"layers.{int(layer_id)}" if prefix is None else prefix,
+        ranks=int(ranks),
+        compress_ratio=int(compress_ratio),
+        n_routed_experts=int(n_routed_experts),
+        include_tid2eid=bool(include_tid2eid),
+        include_gate_bias=bool(include_gate_bias),
     )
-    tensors.update(
-        _pack_deepseek_v4_routed_experts(
-            prefix,
-            raw,
-            ranks=ranks,
-            n_routed_experts=n_routed_experts,
-            destinations=destinations,
-        )
+    tensors = pack_layer(
+        DEEPSEEK_V4_LAYER_RULES,
+        raw,
+        context,
+        policy=deepseek_v4_replicate(int(ranks)),
+        expert_policy=deepseek_v4_expert_parallel(int(ranks), int(n_routed_experts)),
+        factories=deepseek_v4_factories(),
+        destinations=destinations,
+        missing_source_error=DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+        missing_expert_error=DEEPSEEK_V4_EXPERT_MISSING_ERROR,
     )
     return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
 
 
-def _pack_wo_a(weight: torch.Tensor) -> torch.Tensor:
-    """Pack flattened output-LoRA A projection to ``[o_groups, o_lora, group_in]``."""
-    if weight.ndim != 2:
-        raise ValueError(f"wo_a weight must be rank-2, got shape={tuple(weight.shape)}")
-    if int(weight.shape[0]) % _DEEPSEEK_V4_O_GROUPS != 0:
-        raise ValueError(
-            f"wo_a first dimension {int(weight.shape[0])} must divide by {_DEEPSEEK_V4_O_GROUPS}"
-        )
-    return weight.reshape(
-        _DEEPSEEK_V4_O_GROUPS, int(weight.shape[0]) // _DEEPSEEK_V4_O_GROUPS, int(weight.shape[1])
-    )
-
-
-def _pack_deepseek_v4_optional_attention(
-    prefix: str,
-    raw: Mapping[str, torch.Tensor],
-    ranks: int,
-    *,
-    compress_ratio: int,
-    destinations: Mapping[str, torch.Tensor] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Pack compressor/indexer tensors, filling inactive branch placeholders."""
-
-    def raw_tensor(suffix: str) -> torch.Tensor | None:
-        return raw.get(f"{prefix}.{suffix}")
-
-    packed: dict[str, torch.Tensor] = {}
-
-    def add(
-        name: str,
-        suffix: str,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        *,
-        enabled: bool,
-        transpose: bool = False,
-    ) -> None:
-        if destinations is not None and name not in destinations:
-            return
-        tensor = raw_tensor(suffix) if enabled else None
-        if tensor is None:
-            destination = None if destinations is None else destinations[name]
-            expected_shape = (ranks, *shape)
-            if destination is not None:
-                if tuple(destination.shape) != expected_shape or destination.dtype != dtype:
-                    raise ValueError(
-                        f"packed DeepSeekV4 destination {name} shape/dtype mismatch: "
-                        f"expected={expected_shape}/{dtype}, "
-                        f"got={tuple(destination.shape)}/{destination.dtype}"
-                    )
-                destination.zero_()
-                packed[name] = destination
-            else:
-                packed[name] = torch.zeros(expected_shape, dtype=dtype)
-            return
-        source = tensor.transpose(0, 1) if transpose else tensor
-        destination = None if destinations is None else destinations[name]
-        packed[name] = _replicate_weight(
-            name,
-            source,
-            ranks=ranks,
-            dtype=dtype,
-            destination=destination,
-        )
-
-    def add_tensor(name: str, tensor: torch.Tensor, *, dtype: torch.dtype) -> None:
-        if destinations is not None and name not in destinations:
-            return
-        destination = None if destinations is None else destinations[name]
-        packed[name] = _replicate_weight(
-            name,
-            tensor,
-            ranks=ranks,
-            dtype=dtype,
-            destination=destination,
-        )
-
-    is_hca = int(compress_ratio) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO
-    is_csa = int(compress_ratio) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO
-    add(
-        "hca_cmp_wkv",
-        "attn.compressor.wkv.weight",
-        (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-        torch.bfloat16,
-        enabled=is_hca,
-    )
-    add(
-        "hca_cmp_wgate",
-        "attn.compressor.wgate.weight",
-        (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-        torch.bfloat16,
-        enabled=is_hca,
-    )
-    add(
-        "hca_cmp_ape",
-        "attn.compressor.ape",
-        (_DEEPSEEK_V4_HCA_COMPRESS_RATIO, _DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
-        torch.float32,
-        enabled=is_hca,
-    )
-    add(
-        "hca_cmp_norm_w",
-        "attn.compressor.norm.weight",
-        (_DEEPSEEK_V4_HEAD_DIM,),
-        torch.bfloat16,
-        enabled=is_hca,
-    )
-    add(
-        "csa_cmp_wkv",
-        "attn.compressor.wkv.weight",
-        (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-        torch.bfloat16,
-        enabled=is_csa,
-    )
-    add(
-        "csa_cmp_wgate",
-        "attn.compressor.wgate.weight",
-        (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-        torch.bfloat16,
-        enabled=is_csa,
-    )
-    add(
-        "csa_cmp_ape",
-        "attn.compressor.ape",
-        (_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
-        torch.float32,
-        enabled=is_csa,
-    )
-    add(
-        "csa_cmp_norm_w",
-        "attn.compressor.norm.weight",
-        (_DEEPSEEK_V4_HEAD_DIM,),
-        torch.bfloat16,
-        enabled=is_csa,
-    )
-    add(
-        "csa_idx_wq_b",
-        "attn.indexer.wq_b.weight",
-        (_DEEPSEEK_V4_Q_LORA, _DEEPSEEK_V4_ATTENTION_OUT // 4),
-        torch.int8,
-        enabled=is_csa,
-        transpose=True,
-    )
-    add(
-        "csa_idx_wq_b_scale",
-        "attn.indexer.wq_b.scale",
-        (_DEEPSEEK_V4_ATTENTION_OUT // 4,),
-        torch.float32,
-        enabled=is_csa,
-    )
-    add(
-        "csa_weights_proj",
-        "attn.indexer.weights_proj.weight",
-        (_DEEPSEEK_V4_HIDDEN_SIZE, 64),
-        torch.bfloat16,
-        enabled=is_csa,
-        transpose=True,
-    )
-    add_tensor("csa_hadamard_idx", deepseek_v4_hadamard_idx(), dtype=torch.bfloat16)
-    add(
-        "csa_inner_wkv",
-        "attn.indexer.compressor.wkv.weight",
-        (_DEEPSEEK_V4_CSA_INNER_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-        torch.bfloat16,
-        enabled=is_csa,
-    )
-    add(
-        "csa_inner_wgate",
-        "attn.indexer.compressor.wgate.weight",
-        (_DEEPSEEK_V4_CSA_INNER_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
-        torch.bfloat16,
-        enabled=is_csa,
-    )
-    add(
-        "csa_inner_ape",
-        "attn.indexer.compressor.ape",
-        (_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_INNER_OUT_DIM),
-        torch.float32,
-        enabled=is_csa,
-    )
-    add(
-        "csa_inner_norm_w",
-        "attn.indexer.compressor.norm.weight",
-        (_DEEPSEEK_V4_HADAMARD_IDX_DIM,),
-        torch.bfloat16,
-        enabled=is_csa,
-    )
-    return packed
-
-
-def _pack_deepseek_v4_router(
-    prefix: str,
-    raw: Mapping[str, torch.Tensor],
-    *,
-    ranks: int,
-    n_routed_experts: int,
-    include_tid2eid: bool,
-    include_gate_bias: bool,
-    destinations: Mapping[str, torch.Tensor] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Pack router-only tensors and placeholders for inactive router modes."""
-    gate_bias = raw.get(f"{prefix}.ffn.gate.bias")
-    if gate_bias is None:
-        if include_gate_bias:
-            raise KeyError(f"missing raw DeepSeekV4 layer tensor: {prefix}.ffn.gate.bias")
-        gate_bias = torch.zeros((n_routed_experts,), dtype=torch.float32)
-    tid2eid = raw.get(f"{prefix}.ffn.gate.tid2eid")
-    if tid2eid is None:
-        if include_tid2eid:
-            raise KeyError(f"missing raw DeepSeekV4 layer tensor: {prefix}.ffn.gate.tid2eid")
-        tid2eid = torch.zeros((_DEEPSEEK_V4_VOCAB_SIZE, _DEEPSEEK_V4_TOPK), dtype=torch.int32)
-    return {
-        "gate_bias": _replicate_weight(
-            "gate_bias",
-            gate_bias,
-            ranks=ranks,
-            dtype=torch.float32,
-            destination=None if destinations is None else destinations["gate_bias"],
-        ),
-        "tid2eid": _replicate_weight(
-            "tid2eid",
-            tid2eid,
-            ranks=ranks,
-            dtype=torch.int32,
-            destination=None if destinations is None else destinations["tid2eid"],
-        ),
-    }
-
-
-def _pack_deepseek_v4_routed_experts(
-    prefix: str,
-    raw: Mapping[str, torch.Tensor],
-    *,
-    ranks: int,
-    n_routed_experts: int,
-    destinations: Mapping[str, torch.Tensor] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Stack rank-local routed experts into EP-rank-major tensors."""
-
-    def expert(expert_id: int, suffix: str) -> torch.Tensor:
-        name = f"{prefix}.ffn.experts.{expert_id}.{suffix}"
-        try:
-            return raw[name]
-        except KeyError as exc:
-            raise KeyError(f"missing raw DeepSeekV4 expert tensor: {name}") from exc
-
-    def stack(name: str, suffix: str, dtype: torch.dtype) -> torch.Tensor:
-        if destinations is not None:
-            destination = destinations[name]
-            local_experts = n_routed_experts // ranks
-            first = expert(0, suffix)
-            expected_shape = (ranks, local_experts, *first.shape)
-            if tuple(destination.shape) != expected_shape or destination.dtype != dtype:
-                raise ValueError(
-                    f"packed DeepSeekV4 destination {name} shape/dtype mismatch: "
-                    f"expected={expected_shape}/{dtype}, "
-                    f"got={tuple(destination.shape)}/{destination.dtype}"
-                )
-            for rank in range(ranks):
-                ids = deepseek_v4_local_expert_ids(
-                    rank=rank,
-                    ranks=ranks,
-                    n_routed_experts=n_routed_experts,
-                )
-                for local_index, expert_id in enumerate(ids):
-                    destination[rank, local_index].copy_(expert(expert_id, suffix))
-            return destination
-
-        per_rank = []
-        for rank in range(ranks):
-            ids = deepseek_v4_local_expert_ids(
-                rank=rank,
-                ranks=ranks,
-                n_routed_experts=n_routed_experts,
-            )
-            per_rank.append(
-                torch.stack(
-                    [expert(expert_id, suffix).to(dtype=dtype).contiguous().cpu() for expert_id in ids],
-                    dim=0,
-                )
-            )
-        return torch.stack(per_rank, dim=0).contiguous()
-
-    return {
-        "routed_w1": stack("routed_w1", "w1.weight", torch.int8),
-        "routed_w1_scale": stack("routed_w1_scale", "w1.scale", torch.float32),
-        "routed_w3": stack("routed_w3", "w3.weight", torch.int8),
-        "routed_w3_scale": stack("routed_w3_scale", "w3.scale", torch.float32),
-        "routed_w2": stack("routed_w2", "w2.weight", torch.int8),
-        "routed_w2_scale": stack("routed_w2_scale", "w2.scale", torch.float32),
-    }
