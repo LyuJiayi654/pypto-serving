@@ -4151,7 +4151,20 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         return worker
 
     def _inherited_host_weights(self) -> list[torch.Tensor]:
-        """Return immutable main and MTP weights that must be visible at worker fork."""
+        """Return the resident main and MTP weights that must be visible at worker fork.
+
+        Passing this list to ``inherited_host_tensors`` is a guarantee, not a hint: pypto
+        names these ranges in place instead of staging a full host copy of them, on our word
+        that every one is backed by a mapping visible across processes and that the mapping
+        outlives the worker. It cannot check that — the prepacked sidecar is ``MAP_SHARED``
+        but reaches torch through ``mmap`` + ``from_numpy``, so ``torch.is_shared()`` reports
+        ``False`` for all of it, and pypto warns once at prepare time that it is trusting us.
+
+        So anything added here must be backed by shared memory or a shared file mapping, and
+        written before the fork and never after. A ``MAP_PRIVATE`` tensor in this list does
+        not fail loudly: copy-on-write leaves the child reading its pre-fork snapshot and the
+        upload carries stale bytes.
+        """
         tensors = list(self._stacked_host_weights.values()) if self._stacked_host_weights else []
         global_weights = getattr(self, "_global_weights", None)
         if global_weights is not None:
