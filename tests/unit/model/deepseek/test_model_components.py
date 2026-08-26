@@ -2162,7 +2162,6 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
     )
     pending = runner.dispatch_prepared_decode(model, batch, prepared)
     assert pending.states == (state,)
-    assert runner._decode_metadata_predecessor is pending.dispatch
 
 
 def test_deepseek_prefill_context_preserves_prepare_reserved_state(monkeypatch):
@@ -3434,19 +3433,6 @@ class _TaskArgsStubRunner:
         self._cache = {n: object() for n in _PREFILL_CACHE_POOLS}
         self._embed_handle = object()
         self._pre_hc_handle = object()
-        self._decode_metadata = {
-            name: object()
-            for name in (
-                "block_table",
-                "hca_cmp_block_table",
-                "csa_cmp_block_table",
-                "idx_block_table",
-                "hca_compress_state_block_table",
-                "csa_compress_state_block_table",
-                "csa_inner_compress_state_block_table",
-                "block_counts",
-            )
-        }
         self._decode_task_args = [
             SimpleNamespace(
                 tensors={"block_table": torch.empty(layout.ranks, 4, dtype=torch.int32).share_memory_()}
@@ -3467,9 +3453,6 @@ class _TaskArgsStubRunner:
 
     def _materialize_main_pre_hc_device(self, hidden):
         return self._pre_hc_handle
-
-    def _materialize_decode_device_metadata(self, _buffer_slot):
-        return self._decode_metadata
 
     def _static_freqs_cos_tensor(self):
         return torch.empty((2, 8, 4), dtype=torch.bfloat16).share_memory_()
@@ -3646,9 +3629,17 @@ def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
     for name in ("hidden_out", "logits", "pre_hc_hidden_out"):
         assert isinstance(decode.tensors[name], StackedDeviceTensor)
     assert isinstance(decode.tensors["sampled_ids"], torch.Tensor)
-    built = decode.build()
-    for name, tensor in runner._decode_metadata.items():
-        assert built[decode.names.index(name)] is tensor
+    for name in (
+        "block_table",
+        "hca_cmp_block_table",
+        "csa_cmp_block_table",
+        "idx_block_table",
+        "hca_compress_state_block_table",
+        "csa_compress_state_block_table",
+        "csa_inner_compress_state_block_table",
+        "block_counts",
+    ):
+        assert isinstance(decode.tensors[name], torch.Tensor)
 
     mtp = mtp_decode_task_args(runner, 4096)
     mtp.allocate_host_shared(None)
@@ -3664,12 +3655,11 @@ def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
     assert isinstance(mtp.tensors["accepted_counts"], torch.Tensor)
     assert isinstance(mtp.tensors["sampled_ids"], torch.Tensor)
 
-    resident_metadata = [
-        runner._decode_metadata,
-        {**runner._decode_metadata, "block_table": object()},
+    block_tables = [object(), object()]
+    runner._decode_task_args = [
+        SimpleNamespace(tensors={"block_table": block_table})
+        for block_table in block_tables
     ]
-    runner._decode_task_args = [SimpleNamespace(tensors={}), SimpleNamespace(tensors={})]
-    runner._materialize_decode_device_metadata = lambda slot: resident_metadata[slot]
     runner._mtp_device_weights = {
         name: object() for name in _FUSED_MTP_DECODE_TENSOR_ORDER
     }
@@ -3684,79 +3674,5 @@ def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
     slot_one_args = slot_one_mtp.build()
     assert (
         slot_one_args[slot_one_mtp.names.index("ori_block_table")]
-        is resident_metadata[1]["block_table"]
+        is block_tables[1]
     )
-
-
-def test_deepseek_fused_metadata_is_resident_per_ping_pong_slot_and_dirty_rank():
-    runner = DeepSeekV4ModelRunner(
-        compiled=DeepSeekV4CompiledKernels(
-            layout=DeepSeekV4CacheLayout(ranks=2),
-            model_dir="",
-            weight_map={},
-            weight_store=None,
-            compress_ratios=(),
-            layer_plan=(),
-            kernel_dir="",
-            num_speculative_tokens=1,
-        )
-    )
-    runner._decode_metadata_sources = [
-        {"block_table": torch.empty((2, 3), dtype=torch.int32).share_memory_()}
-        for _slot in (0, 1)
-    ]
-    runner._decode_metadata_device_keys = [[None, None], [None, None]]
-
-    class _Worker:
-        def __init__(self):
-            self.next_ptr = 0x1000
-            self.copies = []
-            self.events = []
-
-        def alloc_tensor(self, shape, dtype, *, worker_id=0, init=None):
-            tensor = DeviceTensor(self.next_ptr, tuple(shape), dtype)
-            self.next_ptr += 0x100000
-            return tensor
-
-        def copy_to(self, dst, src, nbytes, *, worker_id=0):
-            self.events.append("copy")
-            self.copies.append((dst, src, nbytes, worker_id))
-
-        @staticmethod
-        def free_tensor(_tensor, *, worker_id=0):
-            return None
-
-        @staticmethod
-        def free_stacked_tensor(_tensor):
-            return None
-
-        @staticmethod
-        def close():
-            return None
-
-    worker = _Worker()
-    runner._l3_worker = worker
-    slot0 = runner._materialize_decode_device_metadata(0)
-    slot1 = runner._materialize_decode_device_metadata(1)
-    runner._decode_metadata_predecessor = SimpleNamespace(
-        wait=lambda: worker.events.append("wait")
-    )
-
-    assert slot0["block_table"].shards[0].data_ptr != slot1["block_table"].shards[0].data_ptr
-
-    runner._sync_decode_device_metadata_rank(0, 0, ("first",))
-    steady_predecessor = SimpleNamespace(wait=lambda: worker.events.append("wait"))
-    runner._decode_metadata_predecessor = steady_predecessor
-    runner._sync_decode_device_metadata_rank(0, 0, ("first",))
-    assert runner._decode_metadata_predecessor is steady_predecessor
-    runner._sync_decode_device_metadata_rank(0, 1, ("first",))
-    runner._sync_decode_device_metadata_rank(1, 0, ("first",))
-
-    assert len(worker.copies) == 3
-    assert worker.events == ["wait", "copy", "wait", "copy", "copy"]
-    assert [copy[-1] for copy in worker.copies] == [0, 1, 0]
-    assert runner._decode_metadata_predecessor is None
-    assert runner._decode_metadata_device_keys == [
-        [("first",), ("first",)],
-        [("first",), None],
-    ]
