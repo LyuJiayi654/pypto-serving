@@ -35,19 +35,15 @@ The defaults are:
 - serving: DP=8, EP=8, MTP enabled, fused one-L2 decode, prefix cache disabled
 - Simpler: host STRACE enabled with `PYPTO_RUNTIME_LOG=v9`
 - device STRACE: disabled with `SIMPLER_DEVICE_STRACE_ENABLE=0`
-- runtime: 2 GiB ring heap, with task and dependency windows set to 131072
-- timeouts: Simpler scheduler 320 s, op execution 400 s, stream sync 440 s, and
-  serving worker step 1800 s
+- runtime: simpler ring sizing follows the `pypto-serving` configuration
+  (`--ring-dep-pool` / `--ring-task-window` / `--ring-heap`), otherwise the
+  pypto runtime default
 - serving profiling: on-demand `--profile --profile-level verbose`, with output under the
   artifact directory
 
 Pass `--use-compile-cache` to reuse kernels from the serving worker's device-specific
 `pypto_build_dir`. Reuse the same assigned devices, model configuration, and kernel sources;
 the current cache has no fingerprinting and stale binaries are not detected automatically.
-
-Use the current `SIMPLER_SCHEDULER_TIMEOUT_MS`, `SIMPLER_OP_EXECUTE_TIMEOUT_US`,
-and `SIMPLER_STREAM_SYNC_TIMEOUT_MS` names. The former `PTO2_*TIMEOUT*` names are
-not compatibility aliases and do not affect current Simpler runtime timeouts.
 
 Select paths and assigned devices explicitly when defaults are unsuitable:
 

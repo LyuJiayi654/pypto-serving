@@ -1144,6 +1144,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             hidden_size=config.hidden_size,
         )
         self._cache_group_specs = self._resolve_cache_group_specs(config, runtime)
+        self._configure_l3_rings(runtime)
 
         # Shape/metadata-only unit tests construct a runner without compiled
         # callables. Preserve a deterministic fixed fallback for that path; the

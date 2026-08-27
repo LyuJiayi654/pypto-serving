@@ -159,6 +159,16 @@ class RuntimeConfig:
     num_speculative_tokens: int = 0
     # Model-specific cache families. Empty means the generic single KV pool.
     kv_cache_groups: tuple[KVCacheGroupSpec, ...] = ()
+    # Simpler ring sizing forwarded per-dispatch through pypto's RunConfig
+    # (CallConfig.runtime_env) on every l3_worker.run/submit — replacing the
+    # process-wide PTO2_RING_* envs, which sized rings for every worker in the
+    # process, not just L3 dispatches. Each field takes a scalar (broadcast to
+    # all scope-depth rings) or a list of exactly 4 ints sizing rings 0..3;
+    # ``None`` leaves the field unset so the pypto runtime's own default
+    # applies.
+    ring_dep_pool: int | list[int] | None = None
+    ring_task_window: int | list[int] | None = None
+    ring_heap: int | list[int] | None = None
 
 
 @dataclass(frozen=True)

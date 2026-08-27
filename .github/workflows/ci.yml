@@ -97,9 +97,6 @@ jobs:
       - name: Run Qwen3 accuracy guard
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
@@ -107,18 +104,12 @@ jobs:
           run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
           run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
-          run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
-          run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
-          run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
           task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
 
       - name: Run Qwen3 serving guard (prefix cache, chunked prefill, multi-batch)
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
-          PTO2_RING_DEP_POOL: 16384
-          PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
@@ -126,22 +117,12 @@ jobs:
           run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
           run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
-          run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
-          run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
-          run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
           task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
 
       - name: Run DeepSeek V4 MTP HTTP matrix
         env:
           PYPTO_RUNTIME_LOG: error
-          PTO2_RING_DEP_POOL: 131072
-          PTO2_RING_TASK_WINDOW: 131072
-          PTO2_RING_HEAP: 2147483648
-          PTO2_OP_EXECUTE_TIMEOUT_US: 400000000
-          PTO2_STREAM_SYNC_TIMEOUT_MS: 440000
-          PTO2_SCHEDULER_TIMEOUT_MS: 320000
-          SERVING_WORKER_STEP_TIMEOUT: 1800
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
@@ -150,13 +131,6 @@ jobs:
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
-          run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
-          run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
-          run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
-          run_cmd="$run_cmd PTO2_OP_EXECUTE_TIMEOUT_US=$PTO2_OP_EXECUTE_TIMEOUT_US"
-          run_cmd="$run_cmd PTO2_STREAM_SYNC_TIMEOUT_MS=$PTO2_STREAM_SYNC_TIMEOUT_MS"
-          run_cmd="$run_cmd PTO2_SCHEDULER_TIMEOUT_MS=$PTO2_SCHEDULER_TIMEOUT_MS"
-          run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
           run_cmd="$run_cmd PYPTO_DSV4_SKIP_STANDALONE_MTP=1"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \

@@ -22,6 +22,14 @@ only in parameters already expressible here:
 
 The worker itself (fork, persistence flags, inherited host tensors) is
 runner-specific, so ``_shared_l3_worker`` stays abstract.
+
+The mixin also owns the per-dispatch simpler ring sizing: instead of the old
+process-wide ``PTO2_RING_*`` envs (which resized rings for every worker in the
+process, staging pools included), ``_configure_l3_rings`` installs a pypto
+``RunConfig`` whose ``ring_*`` fields are forwarded to ``CallConfig.runtime_env``
+on each ``worker.run`` / ``worker.submit`` — scoping the sizing to L3 dispatches
+only. Runners call it from ``init_kv_cache`` (before the first dispatch) with
+the values straight from ``RuntimeConfig``.
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from pypto_serving.config.types import RuntimeConfig
 from pypto_serving.tools.profile import profile_span
 
 from .buffer_set import resolve_l3_arg
@@ -85,12 +94,40 @@ class L3DispatchMixin:
     _l3_worker: Any | None
     _l3_static_tensors: dict[tuple, Any]
     _l3_stacked: bool
+    _l3_run_config: Any | None
 
     def _init_l3_dispatch(self, *, stacked: bool) -> None:
         """Initialize the shared dispatch state. Call from the runner ``__init__``."""
         self._l3_worker = None
         self._l3_static_tensors: dict[tuple, Any] = {}
         self._l3_stacked = stacked
+        self._l3_run_config = None
+
+    def _configure_l3_rings(self, runtime: RuntimeConfig) -> None:
+        """Install the per-dispatch simpler ring sizing for L3 dispatches.
+
+        Replaces the process-wide ``PTO2_RING_DEP_POOL`` / ``PTO2_RING_TASK_WINDOW``
+        / ``PTO2_RING_HEAP`` envs, which sized rings for every worker in the
+        process; the values here scope to L3 dispatches alone via pypto's
+        per-dispatch ``RunConfig`` (``CallConfig.runtime_env``). Each value is
+        a scalar (broadcast to all scope-depth rings) or a list of exactly 4
+        ints sizing rings 0..3; an unset field stays ``None`` so the pypto
+        runtime's own default applies. When every field is unset no RunConfig
+        is passed at all, keeping the dispatch baseline unchanged.
+        """
+        if all(
+            value is None
+            for value in (runtime.ring_dep_pool, runtime.ring_task_window, runtime.ring_heap)
+        ):
+            self._l3_run_config = None
+            return
+        from pypto.runtime import RunConfig  # noqa: PLC0415
+
+        self._l3_run_config = RunConfig(
+            ring_dep_pool=runtime.ring_dep_pool,
+            ring_task_window=runtime.ring_task_window,
+            ring_heap=runtime.ring_heap,
+        )
 
     def _shared_l3_worker(self) -> Any:
         """Return the persistent ``DistributedWorker`` (runner-specific fork logic)."""
@@ -127,7 +164,9 @@ class L3DispatchMixin:
                     level="kernel",
                     args=dict(span_args),
                 ):
-                    worker.run(callable_spec.compiled, *l3_args)
+                    worker.run(
+                        callable_spec.compiled, *l3_args, config=self._l3_run_config,
+                    )
             finally:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
@@ -162,7 +201,9 @@ class L3DispatchMixin:
                 level="kernel",
                 args=dict(span_args),
             ):
-                handle = worker.submit(callable_spec.compiled, *l3_args)
+                handle = worker.submit(
+                    callable_spec.compiled, *l3_args, config=self._l3_run_config,
+                )
         except BaseException:
             for tensor in uploaded:
                 worker.free_tensor(tensor)
