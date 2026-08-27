@@ -115,6 +115,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fraction of total NPU HBM the server is allowed to use "
         "(weights + activations + KV cache). Default: 0.90.",
     )
+    parser.add_argument(
+        "--ring-dep-pool",
+        type=_parse_ring_value,
+        default=None,
+        metavar="N | N,N,N,N",
+        help=(
+            "Simpler ring dependency-edge pool capacity, applied per-dispatch "
+            "through pypto's RunConfig. A single int broadcasts to all "
+            "scope-depth rings; a comma-separated list of 4 ints sizes rings "
+            "0..3 (a 0 entry leaves that ring at its default). Default: the "
+            "pypto runtime default."
+        ),
+    )
+    parser.add_argument(
+        "--ring-task-window",
+        type=_parse_ring_value,
+        default=None,
+        metavar="N | N,N,N,N",
+        help=(
+            "Simpler ring task-slot window (in-flight tasks), applied "
+            "per-dispatch through pypto's RunConfig. A single int broadcasts "
+            "to all scope-depth rings; a comma-separated list of 4 ints sizes "
+            "rings 0..3 (a 0 entry leaves that ring at its default). Default: "
+            "the pypto runtime default."
+        ),
+    )
+    parser.add_argument(
+        "--ring-heap",
+        type=_parse_ring_value,
+        default=None,
+        metavar="N | N,N,N,N",
+        help=(
+            "Simpler per-ring output-heap size in bytes, applied per-dispatch "
+            "through pypto's RunConfig. A single int broadcasts to all "
+            "scope-depth rings; a comma-separated list of 4 ints sizes rings "
+            "0..3 (a 0 entry leaves that ring at its default). Default: the "
+            "pypto runtime default."
+        ),
+    )
 
     # Generation
     parser.add_argument(
@@ -337,6 +376,9 @@ def _build_runtime_config(
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,
+        ring_dep_pool=args.ring_dep_pool,
+        ring_task_window=args.ring_task_window,
+        ring_heap=args.ring_heap,
     )
 
 
@@ -373,6 +415,30 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
     if legacy_enabled and configured == 0:
         raise ValueError("--enable-mtp conflicts with --num-speculative-tokens 0")
     return configured
+
+
+def _parse_ring_value(value: str) -> int | list[int]:
+    """Parse a ring-sizing CLI value: one int or a comma-separated per-ring list.
+
+    A single int broadcasts to all scope-depth rings; ``a,b,c,d`` sizes rings
+    0..3 (a ``0`` entry leaves that ring at its default). Deeper constraints
+    (power-of-two minimums, entry count) are enforced by pypto's ``RunConfig``
+    at engine start.
+    """
+    parts = [part.strip() for part in value.split(",")]
+    if not all(parts):
+        raise argparse.ArgumentTypeError(
+            f"ring value must be an int or comma-separated ints, got {value!r}"
+        )
+    try:
+        sizes = [int(part) for part in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"ring value must be an int or comma-separated ints, got {value!r}"
+        ) from None
+    if any(size < 0 for size in sizes):
+        raise argparse.ArgumentTypeError(f"ring sizes must be non-negative, got {value!r}")
+    return sizes[0] if len(sizes) == 1 else sizes
 
 
 def _parse_speculative_config(value: str) -> dict[str, object]:

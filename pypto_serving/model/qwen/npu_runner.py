@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -217,6 +216,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             )
             return num_pages
         self._pending_kv_cache_specs[model_id] = (config, runtime)
+        self._configure_l3_rings(runtime)
 
         logger.info("[init_kv_cache] creating L3 worker …")
         with profile_span("Qwen314BModelRunner.prepare_l3_worker", cat="executor"):
@@ -370,7 +370,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         ``torch.npu.mem_get_info`` only reports a single total, so each part
         is reconstructed rather than queried: weights (estimated from the
         model config), KV cache (exact = num_pages x bytes_per_page), simpler
-        ring-heap arena (from the ``PTO2_RING_HEAP`` env x 4), and the
+        ring-heap arena (from the dispatch ring config x 4), and the
         residual (compiled buffers + transient activation scratch + overhead).
         """
         free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
@@ -398,9 +398,18 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         )
         kv_bytes = num_pages * bytes_per_page
 
-        # Simpler ring-heap arena — from env (matches _compute_kv_cache_pages).
-        ring_heap = int(os.environ.get("PTO2_RING_HEAP", 256 * 1024 * 1024))
-        arena_bytes = ring_heap * 4 + 128 * 1024 * 1024
+        # Simpler ring-heap arena — from the dispatch ring config (matches
+        # _configure_l3_rings; replaces the old PTO2_RING_HEAP env read). A
+        # scalar broadcasts to the 4 scope-depth rings, a list sizes each;
+        # unset sizing falls back to the historical 256 MiB/ring estimate.
+        ring_heap = runtime.ring_heap
+        if ring_heap is None:
+            heap_total = 4 * 256 * 1024 * 1024
+        elif isinstance(ring_heap, list):
+            heap_total = sum(ring_heap)
+        else:
+            heap_total = ring_heap * 4
+        arena_bytes = heap_total + 128 * 1024 * 1024
 
         residual = used_bytes - weight_bytes - kv_bytes - arena_bytes
 
@@ -425,7 +434,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             f"{worst_case_demand} tokens"
             + ("  [OK]" if kv_tokens >= worst_case_demand else "  [TIGHT]"),
         )
-        logger.info(f"  ├─ simpler arena (env x 4): {arena_bytes / 1e9:7.2f} GB")
+        logger.info(f"  ├─ simpler arena (rings):    {arena_bytes / 1e9:7.2f} GB")
         logger.info(
             f"  └─ residual (buffers/scratch): {residual / 1e9:6.2f} GB "
             f"(compiled buffers + transient activation scratch + overhead)",

@@ -1,11 +1,11 @@
 ---
 name: qwen3-14b-offline-op-timing
-description: Test and analyze OFFLINE generation performance of Qwen3-14B via the `pypto-serving --prompt` generate mode, using the built-in SA_PROFILE Chrome-trace recorder (--profile CLI options) for a per-operator / per-kernel time breakdown (prefill vs decode, device-side kernel duration). The offline counterpart of qwen3-14b-online-perf-test. Use when the user wants to profile a single offline generation for operator/kernel timing (not the HTTP server), or compare offline vs online kernel costs. Uses the same PTO2_* runtime env and the same two workload configs (3338/128/16 and 128/128/16). For the STRACE / host-side offline method see qwen3-14b-offline-perf-test; for the online HTTP server see qwen3-14b-online-perf-test.
+description: Test and analyze OFFLINE generation performance of Qwen3-14B via the `pypto-serving --prompt` generate mode, using the built-in SA_PROFILE Chrome-trace recorder (--profile CLI options) for a per-operator / per-kernel time breakdown (prefill vs decode, device-side kernel duration). The offline counterpart of qwen3-14b-online-perf-test. Use when the user wants to profile a single offline generation for operator/kernel timing (not the HTTP server), or compare offline vs online kernel costs. Uses the same `--ring-*` runtime flags and the same two workload configs (3338/128/16 and 128/128/16). For the STRACE / host-side offline method see qwen3-14b-offline-perf-test; for the online HTTP server see qwen3-14b-online-perf-test.
 ---
 
 # Qwen3-14B offline generation performance profiling
 
-Offline counterpart of `qwen3-14b-online-perf-test`. Same profiling mechanism (the built-in `SA_PROFILE` Chrome-trace recorder in `pypto_serving.tools.profile`) and same `PTO2_*` runtime env, but it profiles a **single offline generation** through the `pypto-serving --prompt` generate mode (same engine as serving: scheduler + worker process, no HTTP server / vllm bench / endpoint involved).
+Offline counterpart of `qwen3-14b-online-perf-test`. Same profiling mechanism (the built-in `SA_PROFILE` Chrome-trace recorder in `pypto_serving.tools.profile`) and the same `--ring-*` runtime flags, but it profiles a **single offline generation** through the `pypto-serving --prompt` generate mode (same engine as serving: scheduler + worker process, no HTTP server / vllm bench / endpoint involved).
 
 The trace it produces has the **same schema and kernel names** as the online skill, so reading and aggregating it is identical — see `qwen3-14b-online-perf-test` §6–§7 for the event schema, kernel-name table, aggregator script, and interpretation. Only the run command and the workload mapping differ (below).
 
@@ -21,7 +21,7 @@ Do not hard-code a commit, user, device id, or path. Use the user's model dir, o
 
 ## 2. Enable profiling
 
-Configured with the CLI profile options (the offline entry no longer reads `SA_PROFILE_*`): `--profile` plus `--profile-output <absolute dir, fresh per run>` and `--profile-level verbose` (must include `kernel`, or there are no `kernel.*_fwd` spans). Output layout is `fragments/trace.<pid>.jsonl` plus a merged `trace.json`. Keep whatever `PTO2_*` runtime env the run template uses.
+Configured with the CLI profile options (the offline entry no longer reads `SA_PROFILE_*`): `--profile` plus `--profile-output <absolute dir, fresh per run>` and `--profile-level verbose` (must include `kernel`, or there are no `kernel.*_fwd` spans). Output layout is `fragments/trace.<pid>.jsonl` plus a merged `trace.json`. Keep whatever `--ring-*` flags the run template uses.
 
 ## 3. Run the offline generation
 
@@ -43,9 +43,8 @@ for _ in $(seq 16); do PROMPT_FLAGS+=' --prompt "$PROMPT"'; done
 export MODEL_DIR PROMPT
 
 task-submit --device auto --run --max-time 0 --timeout 0 \
-"PTO2_OP_EXECUTE_TIMEOUT_US=50000000 PTO2_STREAM_SYNC_TIMEOUT_MS=55000 \
-PTO2_RING_HEAP=2147483648 PTO2_RING_TASK_WINDOW=262144 PTO2_RING_DEP_POOL=262144 \
-pypto-serving \
+"pypto-serving \
+    --ring-heap 2147483648 --ring-task-window 262144 --ring-dep-pool 262144 \
     --model \"$MODEL_DIR\" \
     $PROMPT_FLAGS \
     --platform a2a3 \

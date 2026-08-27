@@ -38,7 +38,7 @@ Output layout for a directory output:
 └── trace.json                    # merged trace, written by /stop_profile
 ```
 
-Keep whatever `PTO2_*` runtime env vars the run template uses (ring heap, op-execute/stream-sync timeouts). They are unrelated to profiling but required for the NPU runtime on this box.
+Keep the `--ring-*` sizing flags the run template uses. They are unrelated to profiling but required for the NPU runtime on this box.
 
 ## 3. Start the server
 
@@ -46,9 +46,8 @@ Run the server with profiling on. Template (queue-wrapped; the `--devices {}` pl
 
 ```bash
 task-submit --device auto --run --max-time 0 --timeout 0 \
-"PTO2_OP_EXECUTE_TIMEOUT_US=50000000 PTO2_STREAM_SYNC_TIMEOUT_MS=55000 \
-PTO2_RING_HEAP=2147483648 PTO2_RING_TASK_WINDOW=262144 PTO2_RING_DEP_POOL=262144 \
-pypto-serving \
+"pypto-serving \
+    --ring-heap 2147483648 --ring-task-window 262144 --ring-dep-pool 262144 \
     --model /path/to/Qwen3-14B \
     --platform a2a3 \
     --port 8899 \

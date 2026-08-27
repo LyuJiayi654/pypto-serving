@@ -140,6 +140,8 @@ def _server_command(
 ) -> list[str]:
     # Keep these serving options aligned with docs/dev/model/deepseek-v4.md.
     # CI substitutes only the checkpoint, task-submit devices, and free port.
+    # The ring sizing (per-dispatch RunConfig) is what this matrix was tuned
+    # for under the old PTO2_RING_* envs.
     return [
         sys.executable,
         "-m",
@@ -171,6 +173,12 @@ def _server_command(
         "--num-speculative-tokens",
         str(num_speculative_tokens),
         "--enable-prefix-caching" if enable_prefix_caching else "--no-enable-prefix-caching",
+        "--ring-dep-pool",
+        "131072",
+        "--ring-task-window",
+        "131072",
+        "--ring-heap",
+        "2147483648",
         "--port",
         str(port),
         "--show-startup-logs",

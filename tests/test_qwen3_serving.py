@@ -140,6 +140,14 @@ def harness():
             device="cpu",
             kv_dtype="bfloat16",
             weight_dtype="float32",
+            # Simpler ring sizing (per-dispatch RunConfig). The CI-era
+            # PTO2_RING_* value 16384 exhausts the dep pool mid-run
+            # ("raise runtime_env.ring_dep_pool"); 262144 is the Qwen
+            # serving-proven sizing. Heap stays 1 GiB so the float32-weight
+            # KV budget still fits.
+            ring_dep_pool=262144,
+            ring_task_window=262144,
+            ring_heap=1073741824,
         ),
         max_num_running_reqs=MAX_BATCH_SIZE,
         long_prefill_token_threshold=default_threshold,
