@@ -384,7 +384,7 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
         )
 
 
-def test_compute_kv_cache_pages_takes_max_of_peak_and_simpler_committed(monkeypatch):
+def test_compute_kv_cache_pages_takes_max_of_peak_and_simpler_committed():
     """non_kv = max(peak_non_kv, simpler_committed); kv_budget = total*util - non_kv.
 
     The driver-visible peak and simpler's committed total overlap (both cover
@@ -396,7 +396,7 @@ def test_compute_kv_cache_pages_takes_max_of_peak_and_simpler_committed(monkeypa
 
     total = 10_000_000_000
     free = 6_000_000_000  # peak_non_kv = total - free = 4 GB
-    monkeypatch.setattr(torch.npu, "mem_get_info", lambda device: (free, total))
+    worker = _MemoryInfoFakeWorker(free, total)
 
     bytes_per_page = (
         config.num_hidden_layers * 2 * config.num_key_value_heads
@@ -409,23 +409,26 @@ def test_compute_kv_cache_pages_takes_max_of_peak_and_simpler_committed(monkeypa
 
     # simpler_committed (5 GB) > peak_non_kv (4 GB): the committed view wins.
     pages_committed_dominates = ModelRunner._compute_kv_cache_pages(
-        config, runtime, device_id=0, simpler_committed=5_000_000_000,
+        config, runtime, worker, simpler_committed=5_000_000_000,
     )
     assert pages_committed_dominates == expected(5_000_000_000)
 
     # simpler_committed (2 GB) < peak_non_kv (4 GB): the driver peak wins.
     pages_peak_dominates = ModelRunner._compute_kv_cache_pages(
-        config, runtime, device_id=0, simpler_committed=2_000_000_000,
+        config, runtime, worker, simpler_committed=2_000_000_000,
     )
     assert pages_peak_dominates == expected(4_000_000_000)
 
     # Unknown committed (0) reproduces the pre-commit peak-only behaviour.
     assert ModelRunner._compute_kv_cache_pages(
-        config, runtime, device_id=0, simpler_committed=0,
+        config, runtime, worker, simpler_committed=0,
     ) == pages_peak_dominates
 
     # A larger non-KV footprint leaves fewer KV pages.
     assert pages_committed_dominates < pages_peak_dominates
+
+    # Sizing always queries logical worker 0 — the chip this runner serves.
+    assert worker.queried_worker_ids == [0, 0, 0]
 
 
 @pytest.mark.parametrize("device_id, device_ids, expected_chip", [
@@ -492,3 +495,15 @@ class _CommittedFakeWorker:
         if self.raises:
             raise RuntimeError("worker not ready")
         return self._committed[chip]
+
+
+class _MemoryInfoFakeWorker:
+    """Stand-in for the L3 Worker exposing only device_memory_info."""
+
+    def __init__(self, free, total):
+        self._info = (free, total)
+        self.queried_worker_ids = []
+
+    def device_memory_info(self, worker_id=0):
+        self.queried_worker_ids.append(worker_id)
+        return self._info

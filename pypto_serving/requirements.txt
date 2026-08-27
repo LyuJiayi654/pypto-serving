@@ -2,7 +2,6 @@ numpy>=2.0
 pypto>=0.1.0
 simpler>=0.1.0
 torch>=2.6.0
-torch-npu>=2.6.0
 safetensors
 transformers
 fastapi

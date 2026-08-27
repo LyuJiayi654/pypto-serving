@@ -1212,12 +1212,18 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 )
             return requested_pages // ori_spec.max_blocks_per_seq
 
+        # Ranks are enumerated as logical Worker IDs on the shared L3 worker:
+        # the query runs in the chip process that owns each device context.
+        # Physical device IDs are metadata for the log/error text only and are
+        # never used to route the query (they may be non-contiguous).
         device_ids = self._compiled.device_ids or (self._compiled.device_id,)
+        worker = self._shared_l3_worker()
         utilization = float(getattr(runtime, "npu_memory_utilization", 0.90))
         budgets = []
         memory_rows = []
-        for device_id in device_ids:
-            free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
+        for worker_id in range(self._compiled.layout.ranks):
+            free_bytes, total_bytes = worker.device_memory_info(worker_id)
+            device_id = device_ids[worker_id] if worker_id < len(device_ids) else worker_id
             peak_non_kv = int(total_bytes) - int(free_bytes)
             budget = int(int(total_bytes) * utilization - peak_non_kv)
             budgets.append(budget)

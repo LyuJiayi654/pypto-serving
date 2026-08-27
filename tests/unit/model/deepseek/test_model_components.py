@@ -1618,8 +1618,8 @@ def test_deepseek_cache_group_specs_leave_physical_capacity_for_runtime_sizing()
         _deepseek_cache_group_specs(16385)
 
 
-def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch):
-    layout = DeepSeekV4CacheLayout(decode_batch=8, decode_seq=1, decode_tokens=8)
+def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget():
+    layout = DeepSeekV4CacheLayout(decode_batch=8, decode_seq=1, decode_tokens=8, ranks=2)
     runner = DeepSeekV4ModelRunner(
         compiled=DeepSeekV4CompiledKernels(
             layout=layout,
@@ -1634,11 +1634,25 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch
         )
     )
     runner._cache_group_specs = _deepseek_cache_group_specs(4096, runner._compiled.compress_ratios)
-    memory = {
-        "npu:2": (5_000_000_000, 10_000_000_000),
-        "npu:5": (4_000_000_000, 10_000_000_000),
-    }
-    monkeypatch.setattr(torch.npu, "mem_get_info", lambda device: memory[device])
+
+    class FakeL3Worker:
+        """device_memory_info keyed by logical worker id (rank order)."""
+
+        def __init__(self, memory_by_worker):
+            self._memory = memory_by_worker
+            self.queried_worker_ids = []
+
+        def device_memory_info(self, worker_id=0):
+            self.queried_worker_ids.append(worker_id)
+            return self._memory[worker_id]
+
+    # Logical worker 0 -> physical npu:2, logical worker 1 -> physical npu:5;
+    # rank 1 is the limiting budget either way.
+    worker = FakeL3Worker({
+        0: (5_000_000_000, 10_000_000_000),
+        1: (4_000_000_000, 10_000_000_000),
+    })
+    runner._l3_worker = worker
     runtime = RuntimeConfig(npu_memory_utilization=0.8)
 
     bytes_per_slot = sum(
@@ -1648,6 +1662,8 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch
     expected = max((2_000_000_000 - scratch_bytes) // bytes_per_slot, 1)
 
     assert runner._compute_kv_cache_capacity_slots(runtime) == expected
+    # Ranks map to logical worker IDs, not the physical device ids (2, 5).
+    assert worker.queried_worker_ids == [0, 1]
 
 
 def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch):
