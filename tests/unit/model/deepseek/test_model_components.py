@@ -1581,6 +1581,18 @@ def test_deepseek_cache_metadata_maps_scheduler_block_ids():
 _DEEPSEEK_TEST_COMPRESS_RATIOS = (0, 0, *([4] * 21), *([128] * 20))
 
 
+class _MemoryInfoFakeL3Worker:
+    """L3 worker stand-in exposing device_memory_info keyed by logical worker id."""
+
+    def __init__(self, memory_by_worker):
+        self._memory = memory_by_worker
+        self.queried_worker_ids = []
+
+    def device_memory_info(self, worker_id=0):
+        self.queried_worker_ids.append(worker_id)
+        return self._memory[worker_id]
+
+
 def _deepseek_cache_group_specs(max_seq_len, compress_ratios=_DEEPSEEK_TEST_COMPRESS_RATIOS):
     return build_deepseek_v4_cache_group_specs(43, compress_ratios, decode_batch=8, max_seq_len=max_seq_len)
 
@@ -1635,20 +1647,9 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget():
     )
     runner._cache_group_specs = _deepseek_cache_group_specs(4096, runner._compiled.compress_ratios)
 
-    class FakeL3Worker:
-        """device_memory_info keyed by logical worker id (rank order)."""
-
-        def __init__(self, memory_by_worker):
-            self._memory = memory_by_worker
-            self.queried_worker_ids = []
-
-        def device_memory_info(self, worker_id=0):
-            self.queried_worker_ids.append(worker_id)
-            return self._memory[worker_id]
-
     # Logical worker 0 -> physical npu:2, logical worker 1 -> physical npu:5;
     # rank 1 is the limiting budget either way.
-    worker = FakeL3Worker({
+    worker = _MemoryInfoFakeL3Worker({
         0: (5_000_000_000, 10_000_000_000),
         1: (4_000_000_000, 10_000_000_000),
     })
@@ -1664,6 +1665,60 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget():
     assert runner._compute_kv_cache_capacity_slots(runtime) == expected
     # Ranks map to logical worker IDs, not the physical device ids (2, 5).
     assert worker.queried_worker_ids == [0, 1]
+
+
+def test_deepseek_cache_sizing_charges_pending_ring_pool():
+    """The per-dispatch ring pool is not yet materialized at sizing time.
+
+    Ring sizing rides the per-dispatch RunConfig, so 4 x ring_heap first
+    appears on the first L3 dispatch — after this sizing, invisible to
+    peak_non_kv. It must be charged against the budget explicitly, or the
+    pool rtMallocs out of the thin (1 - utilization) headroom at first
+    prefill (observed as the 8 GiB pooled-static-arena OOM behind #204's
+    k1 failures).
+    """
+    layout = DeepSeekV4CacheLayout(decode_batch=8, decode_seq=1, decode_tokens=8, ranks=2)
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=tuple([0] * 43),
+            layer_plan=(),
+            kernel_dir="",
+            device_id=0,
+            device_ids=(0, 1),
+        )
+    )
+    runner._cache_group_specs = _deepseek_cache_group_specs(4096, runner._compiled.compress_ratios)
+
+    total = 65_800_000_000
+    free = 18_200_000_000  # post-weights, rings not yet materialized
+    worker = _MemoryInfoFakeL3Worker({
+        0: (free, total),
+        1: (free, total),
+    })
+    runner._l3_worker = worker
+    runtime = RuntimeConfig(npu_memory_utilization=0.90, ring_heap=2147483648)
+
+    bytes_per_slot = sum(
+        spec.max_blocks_per_seq * spec.spec.page_size_bytes for spec in runner._cache_group_specs
+    )
+    scratch_bytes = sum(layout.decode_batch * spec.spec.page_size_bytes for spec in runner._cache_group_specs)
+    budget_without_rings = int(total * 0.90) - (total - free)
+    expected = max((budget_without_rings - 4 * 2147483648 - scratch_bytes) // bytes_per_slot, 1)
+
+    assert runner._compute_kv_cache_capacity_slots(runtime) == expected
+
+    # A list ring_heap sums per-ring instead of broadcasting.
+    runtime_list = RuntimeConfig(
+        npu_memory_utilization=0.90, ring_heap=[2147483648, 2147483648, 2147483648, 1073741824],
+    )
+    expected_list = max(
+        (budget_without_rings - (3 * 2147483648 + 1073741824) - scratch_bytes) // bytes_per_slot, 1,
+    )
+    assert runner._compute_kv_cache_capacity_slots(runtime_list) == expected_list
 
 
 def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch):

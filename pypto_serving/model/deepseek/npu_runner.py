@@ -1219,13 +1219,28 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         device_ids = self._compiled.device_ids or (self._compiled.device_id,)
         worker = self._shared_l3_worker()
         utilization = float(getattr(runtime, "npu_memory_utilization", 0.90))
+        # Ring sizing rides the per-dispatch RunConfig (see _configure_l3_rings),
+        # so the 4 x ring_heap pool is first materialized on the first L3
+        # dispatch — AFTER this sizing, which therefore cannot see it in
+        # peak_non_kv. Charge it against the budget explicitly, or the pool
+        # lands in the (1 - utilization) headroom at first prefill and the
+        # rtMalloc fails (4 x 2 GiB far exceeds ~6.5 GB of headroom on a
+        # 65 GB card). The old process-wide PTO2_RING_HEAP env never had this
+        # problem: it materialized the rings at worker creation, before sizing.
+        ring_heap = getattr(runtime, "ring_heap", None)
+        if ring_heap is None:
+            pending_ring_bytes = 0
+        elif isinstance(ring_heap, (list, tuple)):
+            pending_ring_bytes = sum(int(value) for value in ring_heap)
+        else:
+            pending_ring_bytes = int(ring_heap) * 4
         budgets = []
         memory_rows = []
         for worker_id in range(self._compiled.layout.ranks):
             free_bytes, total_bytes = worker.device_memory_info(worker_id)
             device_id = device_ids[worker_id] if worker_id < len(device_ids) else worker_id
             peak_non_kv = int(total_bytes) - int(free_bytes)
-            budget = int(int(total_bytes) * utilization - peak_non_kv)
+            budget = int(int(total_bytes) * utilization - peak_non_kv - pending_ring_bytes)
             budgets.append(budget)
             memory_rows.append((int(device_id), int(free_bytes), int(total_bytes), budget))
 
@@ -1268,9 +1283,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         capacity_slots = (kv_budget - scratch_bytes) // bytes_per_slot
         logger.info(
             "DeepSeekV4 KV cache sizing: utilization=%.2f, limiting_budget=%.2f GB, "
-            "slot=%.1f MB, scratch=%.1f MB, requested_slots=%d",
+            "pending_rings=%.2f GB, slot=%.1f MB, scratch=%.1f MB, requested_slots=%d",
             utilization,
             kv_budget / 1e9,
+            pending_ring_bytes / 1e9,
             bytes_per_slot / 1e6,
             scratch_bytes / 1e6,
             capacity_slots,
