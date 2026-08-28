@@ -293,6 +293,18 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
             (layout.ranks, layout.decode_tokens),
             dtype=torch.int32,
         ),
+        "sampling_temperatures": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.float32
+        ),
+        "sampling_top_ks": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
+        "sampling_seeds": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
+        "sampling_positions": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
     }
     runner._mtp_buffers = SimpleNamespace()
     runner._mtp_decode_task_args = [SimpleNamespace(tensors=mtp_slots)]
