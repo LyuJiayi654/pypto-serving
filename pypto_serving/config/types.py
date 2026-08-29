@@ -22,7 +22,7 @@ class GenerateConfig:
     """User-facing options that control text generation."""
 
     max_new_tokens: int = 256
-    temperature: float = 0.8
+    temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
     seed: int | None = None

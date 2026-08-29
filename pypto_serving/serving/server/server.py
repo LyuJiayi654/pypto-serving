@@ -414,7 +414,7 @@ class ServingServer:
             kwargs.update(chat_template_kwargs)
         kwargs["tokenize"] = False
         kwargs["add_generation_prompt"] = True
-        return self.engine.tokenizer.tokenizer.apply_chat_template(hf_messages, **kwargs)
+        return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
 
     @staticmethod
     def _map_finish_reason(reason: str) -> str:

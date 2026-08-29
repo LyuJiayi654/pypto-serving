@@ -105,3 +105,10 @@ def test_generate_config_accepts_valid_values():
     assert config.stop == ("END",)
     assert config.stream is True
     assert config.ignore_eos is False
+
+
+@pytest.mark.parametrize("options", [None, {"max_new_tokens": 8}])
+def test_generate_config_defaults_to_greedy(options):
+    config = cli._build_generate_config(options)
+
+    assert config.temperature == 0.0

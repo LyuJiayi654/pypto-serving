@@ -43,14 +43,11 @@ class _FakeEngine:
         self._outputs = outputs
 
     class _FakeTokenizer:
-        class _Inner:
-            def apply_chat_template(self, messages, **kwargs):
-                return " ".join(m["content"] for m in messages)
-
-        tokenizer = _Inner()
-
         def encode(self, text: str) -> list[int]:
             return [1] * max(1, len(text.split()))
+
+        def apply_chat_template(self, messages, **kwargs):
+            return " ".join(m["content"] for m in messages)
 
     tokenizer = _FakeTokenizer()
 

@@ -177,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
             "temperature, top_p, top_k, stop, stream, ignore_eos. Generate "
             "mode: the run's sampling config. Serve mode: server-wide defaults "
             "for request fields that are omitted (default: GenerateConfig "
-            "defaults, e.g. max_new_tokens 256, temperature 0.8, top_p 0.95)."
+            "defaults, e.g. max_new_tokens 256, temperature 0.0, top_p 1.0)."
         ),
     )
     parser.add_argument(

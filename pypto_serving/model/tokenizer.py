@@ -29,6 +29,10 @@ class TokenizerAdapter:
         """Decode token IDs into text."""
         raise NotImplementedError
 
+    def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
+        """Encode chat messages into the model's generation prompt."""
+        raise NotImplementedError
+
     @property
     def bos_token_id(self) -> int | None:
         """Return the beginning-of-sequence token ID, if available."""
@@ -108,6 +112,10 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
         """Decode token IDs, stripping special tokens (EOS / pad / im_end ...) from output."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
+    def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
+        """Apply the Hugging Face chat template loaded with the tokenizer."""
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
+
     @property
     def bos_token_id(self) -> int | None:
         """Return the wrapped tokenizer BOS token ID."""
@@ -124,15 +132,49 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
         return self.tokenizer.pad_token_id
 
 
+@dataclass
+class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
+    """Tokenizer adapter for DeepSeek V4's Python-defined chat encoding."""
+
+    def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
+        from pypto_serving.model.deepseek.encoding import encode_messages
+
+        thinking = bool(kwargs.get("thinking", False) or kwargs.get("enable_thinking", False))
+        reasoning_effort = kwargs.get("reasoning_effort")
+        return encode_messages(
+            messages,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort if isinstance(reasoning_effort, str) else None,
+        )
+
+
 def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
-    """Load a local tokenizer without parsing model config when ``tokenizer.json`` is available."""
+    """Load a local tokenizer and select any model-specific chat encoding."""
     model_path = Path(model_dir)
+    adapter_cls = (
+        DeepSeekV4TokenizerAdapter
+        if _is_deepseek_v4_model(model_path)
+        else TransformersTokenizerAdapter
+    )
     if (model_path / "tokenizer.json").exists():
-        return TransformersTokenizerAdapter.from_tokenizer_file(str(model_path))
-    return TransformersTokenizerAdapter.from_pretrained(
+        return adapter_cls.from_tokenizer_file(str(model_path))
+    return adapter_cls.from_pretrained(
         str(model_path),
         trust_remote_code=trust_remote_code,
     )
+
+
+def _is_deepseek_v4_model(model_path: Path) -> bool:
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    model_type = str(config.get("model_type", "")).lower()
+    architectures = {str(value).lower() for value in config.get("architectures", ())}
+    return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures
 
 
 def _token_content(value: object) -> str | None:
@@ -155,4 +197,7 @@ def _load_fast_tokenizer_from_file(model_path: Path, tokenizer_cls: type) -> obj
         for name in ("bos_token", "eos_token", "pad_token", "unk_token")
         if _token_content(tokenizer_config.get(name)) is not None
     }
+    chat_template = tokenizer_config.get("chat_template")
+    if isinstance(chat_template, (str, dict)):
+        special_tokens["chat_template"] = chat_template
     return tokenizer_cls(tokenizer_file=str(tokenizer_file), **special_tokens)
