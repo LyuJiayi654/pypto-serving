@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import uuid
+from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
@@ -28,6 +29,8 @@ from pypto_serving.tools.profile import (
 )
 
 logger = logging.getLogger(__name__)
+
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 try:
     from fastapi import FastAPI
@@ -70,6 +73,7 @@ class ChatCompletionRequest(BaseModel):
     seed: int | None = None
     stop: list[str] | None = None
     stream: bool = False
+    reasoning_effort: ReasoningEffort | None = None
     chat_template_kwargs: dict | None = None
 
 
@@ -263,7 +267,11 @@ class ServingServer:
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        prompt = self._apply_chat_template(request.messages, request.chat_template_kwargs)
+        prompt = self._apply_chat_template(
+            request.messages,
+            request.chat_template_kwargs,
+            reasoning_effort=request.reasoning_effort,
+        )
         # The OpenAI chat schema has no ignore_eos field, so the server-wide
         # config decides it (the completions endpoint keeps its historic
         # always-ignore-EOS override).
@@ -400,7 +408,11 @@ class ServingServer:
                     break
 
     def _apply_chat_template(
-        self, messages: list[ChatMessage], chat_template_kwargs: dict | None = None,
+        self,
+        messages: list[ChatMessage],
+        chat_template_kwargs: dict | None = None,
+        *,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Apply the model's official chat template, forwarding chat_template_kwargs.
 
@@ -412,6 +424,9 @@ class ServingServer:
         kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
         if chat_template_kwargs:
             kwargs.update(chat_template_kwargs)
+        if reasoning_effort is not None:
+            kwargs.setdefault("enable_thinking", reasoning_effort != "none")
+            kwargs["reasoning_effort"] = reasoning_effort
         kwargs["tokenize"] = False
         kwargs["add_generation_prompt"] = True
         return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)

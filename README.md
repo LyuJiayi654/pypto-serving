@@ -120,6 +120,10 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
 ```
 
+Requests that omit sampling fields use the server-wide `GenerateConfig`
+defaults for every model: `temperature=0.0` (greedy decoding) and `top_p=1.0`.
+Override them per request or with `--generate-config` when starting the server.
+
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run

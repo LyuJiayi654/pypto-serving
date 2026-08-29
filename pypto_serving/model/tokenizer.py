@@ -14,6 +14,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from pypto_serving.model.model_family import detect_model_family, read_model_config
+
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +143,8 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
 
         thinking = bool(kwargs.get("thinking", False) or kwargs.get("enable_thinking", False))
         reasoning_effort = kwargs.get("reasoning_effort")
+        if reasoning_effort == "none" and thinking:
+            reasoning_effort = None
         return encode_messages(
             messages,
             thinking=thinking,
@@ -153,7 +157,7 @@ def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) ->
     model_path = Path(model_dir)
     adapter_cls = (
         DeepSeekV4TokenizerAdapter
-        if _is_deepseek_v4_model(model_path)
+        if detect_model_family(read_model_config(model_path)) == "deepseek_v4"
         else TransformersTokenizerAdapter
     )
     if (model_path / "tokenizer.json").exists():
@@ -162,20 +166,6 @@ def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) ->
         str(model_path),
         trust_remote_code=trust_remote_code,
     )
-
-
-def _is_deepseek_v4_model(model_path: Path) -> bool:
-    config_path = model_path / "config.json"
-    if not config_path.exists():
-        return False
-    try:
-        config = json.loads(config_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    model_type = str(config.get("model_type", "")).lower()
-    architectures = {str(value).lower() for value in config.get("architectures", ())}
-    return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures
-
 
 def _token_content(value: object) -> str | None:
     """Extract a special token string from tokenizer_config JSON."""

@@ -12,11 +12,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 
-BOS_TOKEN = "<｜begin▁of▁sentence｜>"
-EOS_TOKEN = "<｜end▁of▁sentence｜>"
-USER_TOKEN = "<｜User｜>"
-ASSISTANT_TOKEN = "<｜Assistant｜>"
-LATEST_REMINDER_TOKEN = "<｜latest_reminder｜>"
+BOS_TOKEN = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
+EOS_TOKEN = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+USER_TOKEN = "<\uff5cUser\uff5c>"
+ASSISTANT_TOKEN = "<\uff5cAssistant\uff5c>"
+LATEST_REMINDER_TOKEN = "<\uff5clatest_reminder\uff5c>"
 THINKING_START_TOKEN = "<think>"
 THINKING_END_TOKEN = "</think>"
 

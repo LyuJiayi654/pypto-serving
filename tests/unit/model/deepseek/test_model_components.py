@@ -760,18 +760,16 @@ def test_cli_rejects_invalid_deepseek_speculative_config(config, message):
     args = SimpleNamespace(
         speculative_config=config,
         num_speculative_tokens=None,
-        enable_mtp=None,
     )
 
     with pytest.raises(ValueError, match=message):
         cli._resolve_num_speculative_tokens(args)
 
 
-def test_cli_rejects_speculative_config_with_deprecated_alias():
+def test_cli_rejects_speculative_config_with_num_speculative_tokens_alias():
     args = SimpleNamespace(
         speculative_config={"method": "mtp", "num_speculative_tokens": 3},
         num_speculative_tokens=2,
-        enable_mtp=None,
     )
 
     with pytest.raises(ValueError, match="cannot be combined"):

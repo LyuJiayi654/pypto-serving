@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
 from pypto_serving.config.types import GenerateConfig, RuntimeConfig
+from pypto_serving.model.model_family import detect_model_family, read_model_config
 from pypto_serving.tools.profile import (
     ProfileConfig,
     configure_profiler,
@@ -181,12 +182,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--enable-mtp",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Deprecated alias for DeepSeek V4 MTP with one draft token.",
-    )
-    parser.add_argument(
         "--num-speculative-tokens",
         type=int,
         default=None,
@@ -269,16 +264,15 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_dir = str(Path(args.model).resolve())
     executor_kwargs: dict[str, object] = {}
     devices = parse_device_ids(args.devices, default_device=args.device)
-    model_config_data = _read_model_config(Path(model_dir))
-    model_family = _detect_model_family(Path(model_dir), config_data=model_config_data)
+    model_config_data = read_model_config(model_dir)
+    model_family = detect_model_family(model_config_data)
     num_speculative_tokens = _resolve_num_speculative_tokens(args)
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
     elif num_speculative_tokens:
         raise ValueError(
-            "--speculative-config/--num-speculative-tokens/--enable-mtp is only "
-            "supported for DeepSeek V4"
+            "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4"
         )
     executor_kwargs["use_compile_cache"] = args.use_compile_cache
     parallel_config = ParallelConfig(
@@ -383,16 +377,12 @@ def _build_runtime_config(
 
 
 def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
-    """Resolve the vLLM-style config and deprecated standalone aliases."""
+    """Resolve the vLLM-style config and deprecated standalone alias."""
     speculative_config = getattr(args, "speculative_config", None)
     configured = getattr(args, "num_speculative_tokens", None)
-    legacy_value = getattr(args, "enable_mtp", None)
     if speculative_config is not None:
-        if configured is not None or legacy_value is not None:
-            raise ValueError(
-                "--speculative-config cannot be combined with --num-speculative-tokens "
-                "or --enable-mtp/--no-enable-mtp"
-            )
+        if configured is not None:
+            raise ValueError("--speculative-config cannot be combined with --num-speculative-tokens")
         if speculative_config.get("method") != "mtp":
             raise ValueError("DeepSeek V4 --speculative-config requires method='mtp'")
         if "num_speculative_tokens" not in speculative_config:
@@ -406,14 +396,11 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
             raise ValueError("num_speculative_tokens must be positive")
         return configured
 
-    legacy_enabled = bool(legacy_value)
     if configured is None:
-        return 1 if legacy_enabled else 0
+        return 0
     configured = int(configured)
     if configured < 0:
         raise ValueError("--num-speculative-tokens must be non-negative")
-    if legacy_enabled and configured == 0:
-        raise ValueError("--enable-mtp conflicts with --num-speculative-tokens 0")
     return configured
 
 
@@ -550,32 +537,6 @@ def _warn_deprecated_serving_profile_env(args: argparse.Namespace) -> None:
     )
 
 
-def _read_model_config(model_dir: Path) -> dict[str, object]:
-    """Read config.json once for model detection, validation, and runtime setup."""
-    config_path = model_dir / "config.json"
-    if not config_path.exists():
-        return {}
-    try:
-        data = json.loads(config_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _detect_model_family(
-    model_dir: Path,
-    *,
-    config_data: dict[str, object] | None = None,
-) -> str:
-    """Return the serving model family inferred from config.json."""
-    config_data = _read_model_config(model_dir) if config_data is None else config_data
-    model_type = str(config_data.get("model_type") or "").lower()
-    architectures = {str(item).lower() for item in (config_data.get("architectures") or [])}
-    if model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures:
-        return "deepseek_v4"
-    return "qwen"
-
-
 def _executor_cls_for_model_family(model_family: str) -> str:
     """Map model family metadata to the worker executor class id."""
     if model_family == "deepseek_v4":
@@ -594,7 +555,7 @@ def _validate_model_topology(
     if model_family != "deepseek_v4":
         return
     if config_data is None:
-        config_data = _read_model_config(Path(args.model).resolve())
+        config_data = read_model_config(Path(args.model).resolve())
     quantization = config_data.get("quantization_config") or {}
     if quantization.get("quant_method") != "compressed-tensors":
         raise ValueError(

@@ -16,7 +16,6 @@ import pytest
 from pypto_serving.model.deepseek.encoding import encode_messages
 from pypto_serving.model.tokenizer import (
     DeepSeekV4TokenizerAdapter,
-    _is_deepseek_v4_model,
     _load_fast_tokenizer_from_file,
 )
 
@@ -37,15 +36,6 @@ def test_fast_tokenizer_load_preserves_checkpoint_chat_template(tmp_path):
 
     assert tokenizer.kwargs["bos_token"] == "<bos>"
     assert tokenizer.kwargs["chat_template"] == "{{ messages[0].content }}"
-
-
-def test_deepseek_v4_model_detection_uses_config_metadata(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps({
-        "model_type": "deepseek_v4",
-        "architectures": ["DeepseekV4ForCausalLM"],
-    }))
-
-    assert _is_deepseek_v4_model(tmp_path) is True
 
 
 def test_deepseek_v4_defaults_to_chat_mode():
