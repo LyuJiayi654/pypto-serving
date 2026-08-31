@@ -121,12 +121,9 @@ nav:
           - Parallelism and Scaling: user-guide/parallel.md
           - Benchmarking: user-guide/benchmarking.md
           - Profiling: user-guide/profile.md
-          - Performance Tuning: user-guide/performance-tuning.md
       - Models:
-          - Qwen3-14B: models/qwen.md
-          - DeepSeek V4: models/deepseek-v4.md
-          - DeepSeek V4 Checkpoint Conversion: models/deepseek-v4-checkpoint-conversion.md
-          - DeepSeek V4 Prepacked Weights: models/deepseek-v4-prepacked-weights.md
+          - Qwen3-14B: user-guide/qwen.md
+          - DeepSeek V4: user-guide/deepseek-v4.md
   - CLI Reference:
       - Overview: cli-reference/index.md
       - pypto-serving: cli-reference/pypto-serving.md
@@ -137,4 +134,3 @@ nav:
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - DeepSeek V4 Runtime: developer-guide/deepseek-v4-runtime.md
-      

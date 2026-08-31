@@ -10,7 +10,19 @@ PyPTO Serving supports DeepSeek V4 Flash through a converted W8A8 compressed-ten
 - `--block-size 128`.
 - `--long-prefill-token-threshold 2048` or another explicit long-prompt dispatch limit up to the DeepSeek V4 8192-token main-prefill ceiling.
 
-See [DeepSeek V4 Checkpoint Conversion](deepseek-v4-checkpoint-conversion.md) before starting a serving run with a source checkpoint that has not been converted to the PyPTO W8A8 layout.
+See [Checkpoint Conversion](#checkpoint-conversion) before starting a serving run with a source checkpoint that has not been converted to the PyPTO W8A8 layout.
+
+## Checkpoint Conversion
+
+PyPTO Serving expects a DeepSeek V4 W8A8 compressed-tensors checkpoint. The DeepSeek V4 Flash source checkpoint variant validated by this repository mixes FP8 weights with packed MXFP4 expert weights, so it must be converted before serving.
+
+The conversion can run on CPU and does not require `torch_npu`. The source and output directories must be different, and the host must have enough free disk space for both copies.
+
+Run the repository conversion utility documented in [DeepSeek V4 Conversion](../cli-reference/deepseek-v4-conversion.md). The converter writes one safetensors shard at a time using atomic replacement and supports resumable conversion after an interrupted run.
+
+A successful run prints `Conversion complete` and leaves a converted `config.json`, `model.safetensors.index.json`, safetensors shards, and a `.pypto-w8a8-conversion.json` marker in the output directory.
+
+After conversion, [Prepacked Weights](#prepacked-weights) describes the optional sidecar that reduces repeated startup work.
 
 ## 8-Device Offline Generation
 
@@ -91,7 +103,27 @@ The 49 per-layer weights are described declaratively in `pypto_serving/model/dee
 
 DeepSeek V4 layers form three slab groups: `fwd` over all layers, `csa` over the `compress_ratio==4` layers, and `hca` over the `compress_ratio==128` layers. Each group stores its layers contiguously in first-appearance order.
 
-See [DeepSeek V4 Prepacked Weights](deepseek-v4-prepacked-weights.md) for the optional sidecar that reduces repeated startup work.
+See [Prepacked Weights](#prepacked-weights) for the optional sidecar that reduces repeated startup work.
+
+## Prepacked Weights
+
+DeepSeek V4 hidden-layer weights can be converted once into the rank-stacked host layout consumed by the serving runner. The optional sidecar reduces repeated startup work on later launches.
+
+### Build the Sidecar
+
+Use the [`pypto-prepack-deepseek-v4`](../cli-reference/pypto-prepack-deepseek-v4.md) CLI after converting a DeepSeek V4 Flash checkpoint to the W8A8 layout. The default sidecar path is `pypto-deepseek-v4-stacked-r8.safetensors` beside the checkpoint.
+
+### Runtime Behavior
+
+On startup, the DeepSeek V4 loader samples the sidecar's Linux page-cache residency before opening it, then validates a hot sidecar against the checkpoint-file and deployment fingerprint. A hot, valid sidecar is memory mapped as the final layout instead of repacking every hidden layer.
+
+A cold, missing, or stale sidecar falls back to the original checkpoint path, avoiding a cold 323 GiB page-fault stream on the weight-upload path. Rebuild with `--force` after replacing checkpoint shards or changing the packed rank layout.
+
+### Layout Contract
+
+The sidecar layout follows the order produced by `DEEPSEEK_V4_LAYER_RULES`, and its metadata records a name-to-offset map built from that order. Reordering the rule table invalidates already-written sidecars.
+
+The fingerprint covers the config, weight map, and each source shard's size and modification time, which lets startup detect a stale sidecar instead of silently using the wrong layout.
 
 ## Completion Check
 

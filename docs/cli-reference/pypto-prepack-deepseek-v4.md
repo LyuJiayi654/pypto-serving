@@ -29,4 +29,4 @@ pypto-prepack-deepseek-v4 /path/to/dsv4-flash-w8a8 --force
 
 Rebuild the sidecar after replacing checkpoint shards or changing the packed rank layout.
 
-See [DeepSeek V4 Prepacked Weights](../models/deepseek-v4-prepacked-weights.md) for runtime behavior after the sidecar is built.
+See [DeepSeek V4 Prepacked Weights](../user-guide/deepseek-v4.md#prepacked-weights) for runtime behavior after the sidecar is built.

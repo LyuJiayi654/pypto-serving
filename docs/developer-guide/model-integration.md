@@ -15,7 +15,7 @@ Adding a model is a model-integration task, not just a config-file change. Each 
 - Add HTTP serving topology validation in the CLI path.
 - Add unit tests for config and scheduler behavior.
 - Add NPU validation or accuracy checks for generated output.
-- Document the model under `docs/models/`.
+- Document the model under `docs/user-guide/`.
 
 ## Topology
 

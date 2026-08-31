@@ -10,7 +10,7 @@ The external documentation lives under [`docs/`](docs/index.md). Start with:
 - [Quickstart](docs/get-started/quickstart.md)
 - [Online Serving](docs/user-guide/online-serving.md)
 - [CLI Reference](docs/cli-reference/index.md)
-- [DeepSeek V4](docs/models/deepseek-v4.md)
+- [DeepSeek V4](docs/user-guide/deepseek-v4.md)
 
 ## Layout
 
@@ -125,7 +125,7 @@ Override them per request or with `--generate-config` when starting the server.
 
 - All model/device/runtime options are passed via CLI arguments. Run `pypto-serving --help` for the exact arguments available in the installed package. See `docs/cli-reference/pypto-serving.md` for the documented reference.
 - Parallel serving notes live in `docs/user-guide/parallel.md`.
-- DeepSeek V4 checkpoint preparation lives in `docs/models/deepseek-v4-checkpoint-conversion.md`.
+- DeepSeek V4 checkpoint preparation lives in `docs/user-guide/deepseek-v4.md#checkpoint-conversion`.
 - Generated kernel artifacts are written under `build_output/` and are ignored by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the local Ascend runtime environment to be available in the active Python environment.
 - `pypto-lib/` is not included in the wheel. An editable checkout discovers its kernel submodule automatically; for any other installation, set `PYPTO_LIB_ROOT` to the root of a `pypto-lib` checkout before loading a model.

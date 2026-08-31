@@ -43,6 +43,12 @@ pypto-serving \
 | `--use-compile-cache` | off | Reuse compiled kernels from `PYPTO_PROG_BUILD_DIR`. |
 | `--show-startup-logs` | off | Show model loading and kernel compilation logs. |
 
+### Startup and Build Cache
+
+The first NPU run may compile kernels and assemble device binaries. Set `PYPTO_PROG_BUILD_DIR` to choose a persistent build directory, then pass `--use-compile-cache` to reuse compiled programs on later launches.
+
+The compile cache does not perform fingerprint validation. Reuse it only with the same model configuration, platform, assigned devices, and kernel sources. Clear the build directory after any of those inputs changes. Use `--show-startup-logs` when startup progress or cache behavior needs to be visible in the server logs.
+
 ## Parallelism Arguments
 
 | Argument | Default | Description |
@@ -67,6 +73,16 @@ For Qwen-style replica placement, the number of device IDs must equal `dp * tp`.
 | `--ring-dep-pool` | runtime default | Simpler ring dependency-edge pool capacity. A single integer broadcasts to all scope-depth rings; a comma-separated four-integer list sizes rings 0..3, with `0` leaving that ring at its default. |
 | `--ring-task-window` | runtime default | Simpler ring task-slot window capacity. Accepts the same single integer or four-entry list form as `--ring-dep-pool`. |
 | `--ring-heap` | runtime default | Simpler per-ring output-heap size in bytes. Accepts the same single integer or four-entry list form as `--ring-dep-pool`. |
+
+### Capacity Semantics
+
+Continuous batching keeps multiple requests active across engine iterations. Requests move through waiting, prefill, decode, and finished states while the scheduler allocates KV cache pages and dispatches work that fits the configured request and token limits.
+
+`--max-num-seqs` bounds the number of active requests. `--max-num-batched-tokens` bounds the scheduled tokens in one engine iteration. Paged KV cache capacity is determined by `--max-model-len`, `--block-size`, active request count, cache dtype, and available NPU memory.
+
+Standard models use the generic paged KV cache layout. DeepSeek V4 uses model-specific grouped cache pools that match its decode layout and compressed-state requirements; see [DeepSeek V4](../user-guide/deepseek-v4.md) for the topology-specific command lines.
+
+The ring options size Simpler runtime queues and output heap capacity. A single integer applies to every scope-depth ring; a four-entry list controls rings 0 through 3, with `0` preserving that ring's runtime default.
 
 ## Serving Arguments
 
@@ -99,6 +115,14 @@ The HTTP completion path ignores EOS for completion requests and uses standard g
 | `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | enabled | Enable or disable chunked prefill. |
 | `--speculative-config JSON` | unset | DeepSeek V4 MTP config. |
 | `--num-speculative-tokens K` | unset | Deprecated DeepSeek V4 MTP alias. |
+
+### Feature Flag Semantics
+
+Chunked prefill breaks long prompts into scheduler-visible chunks when a prompt exceeds `--long-prefill-token-threshold`. `--no-enable-chunked-prefill` disables that scheduler path.
+
+Prefix caching reuses KV cache state for repeated prompt prefixes when the model path supports it. It is enabled by default for Qwen serving. DeepSeek V4 command examples disable it unless prefix-cache behavior is being validated.
+
+`--speculative-config '{"method":"mtp","num_speculative_tokens":K}'` enables DeepSeek V4 MTP speculative decoding. The deprecated `--num-speculative-tokens` flag remains as a compatibility alias. Model-specific MTP layout and batch-size constraints are documented in [DeepSeek V4](../user-guide/deepseek-v4.md#8-device-dpep-serving).
 
 ## Profiling Arguments
 
