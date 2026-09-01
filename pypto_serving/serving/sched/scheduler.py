@@ -81,7 +81,7 @@ class Request:
     output_token_ids: list[int] = field(default_factory=list)
     stop_strings: tuple[str, ...] = ()
     eos_token_id: int | None = None
-    temperature: float = 0.8
+    temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
     seed: int | None = None

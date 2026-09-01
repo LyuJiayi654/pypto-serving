@@ -97,8 +97,25 @@ and any positive value enables MTP. The
 K>=4. K values larger than seven are supported through repeated target
 verification chunks. Set `--max-num-seqs` no higher than 64, 32, or 16,
 respectively. Non-MTP decode retains B8S1T8. The deprecated
-`--num-speculative-tokens K` and `--enable-mtp`
-flags remain compatibility aliases; `--enable-mtp` selects K=1.
+`--num-speculative-tokens K` flag remains as a compatibility alias.
+
+The server applies DeepSeek V4's model-specific message encoding for chat
+requests because the checkpoint does not ship a Jinja chat template. Chat mode
+is the default:
+
+```bash
+curl --noproxy "*" http://127.0.0.1:8225/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":32}'
+```
+
+Pass `"reasoning_effort":"high"` or
+`"chat_template_kwargs":{"enable_thinking":true}` to use the model's thinking
+prompt. An explicit `enable_thinking` value takes priority when both are given.
+The current API supports string content with system, user, developer, assistant,
+and `latest_reminder` roles; tool calls and multimodal content are not yet
+exposed by the PyPTO request schema. Generation defaults to greedy sampling
+(`temperature=0`).
 
 The main prefill kernel supports a dynamic request extent up to 8192 tokens and
 walks it internally in 128-token tiles. AR and MTP use the same main-prefill

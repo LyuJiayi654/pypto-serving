@@ -16,7 +16,6 @@ from typing import Protocol
 
 import torch
 
-from .tokenizer import TokenizerAdapter, load_tokenizer
 from pypto_serving.config.types import (
     LayerSpec,
     LoadedModel,
@@ -24,6 +23,9 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
 )
+
+from .model_family import is_deepseek_v4_config, read_model_config
+from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
 def _torch_dtype_from_name(name: str) -> torch.dtype:
@@ -322,11 +324,8 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
         """
         if not (model_path / "model.safetensors.index.json").exists():
             return False
-        try:
-            config_data = json.loads((model_path / "config.json").read_text())
-        except json.JSONDecodeError:
-            return False
-        return _is_deepseek_v4_config(config_data)
+        config_data = read_model_config(model_path)
+        return is_deepseek_v4_config(config_data)
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
         """Load tokenizer and metadata without materializing all quantized weights."""
@@ -339,7 +338,7 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
             raise FileNotFoundError(f"Missing model.safetensors.index.json in {model_path}")
 
         config_data = json.loads(config_path.read_text())
-        if not _is_deepseek_v4_config(config_data):
+        if not is_deepseek_v4_config(config_data):
             raise ValueError(f"{model_path} is not a DeepSeekV4 checkpoint")
         quantization = config_data.get("quantization_config", {})
         if quantization.get("quant_method") != "compressed-tensors":
@@ -382,13 +381,6 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
             layer_specs=layer_specs,
             runtime_model=runtime_model,
         )
-
-
-def _is_deepseek_v4_config(config_data: dict) -> bool:
-    """Return whether config metadata names DeepSeekV4."""
-    model_type = str(config_data.get("model_type", "")).lower()
-    architectures = {str(item).lower() for item in config_data.get("architectures", [])}
-    return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures
 
 
 def _build_deepseek_v4_model_config(
