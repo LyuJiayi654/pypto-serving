@@ -19,6 +19,10 @@ serving quantization is applied.
 
 The conversion is shard-by-shard and can be resumed. Existing output shards
 are never overwritten.
+
+Pass ``--no-spec-compatible`` to write the ``num_hidden_layers + 1``
+``compress_ratios`` contract required by current PyPTO serving when MTP is
+disabled. All configured MTP/DSpark draft weights are still converted.
 """
 
 from __future__ import annotations
@@ -48,7 +52,7 @@ FP8_BLOCK_SIZE = 128
 MXFP4_GROUP_SIZE = 32
 INT8_MAX = 127.0
 INT8_AMAX_EPS = 1e-4
-CONVERSION_FORMAT = "pypto-deepseek-v4-w8a8-v2"
+CONVERSION_FORMAT = "pypto-deepseek-v4-w8a8-v3"
 CONVERSION_MARKER = ".pypto-w8a8-conversion.json"
 TensorSpec = tuple[str, tuple[int, ...]]
 
@@ -61,12 +65,52 @@ _LAYER_QUANT_RE = re.compile(
     r")\.weight$"
 )
 _MTP_QUANT_RE = re.compile(
-    r"^mtp\.0\.(?:"
+    r"^mtp\.(?P<mtp_layer>\d+)\.(?:"
     r"attn\.(?:wq_b|wo_b)|"
     r"ffn\.shared_experts\.w[123]|"
     r"ffn\.experts\.\d+\.w[123]|"
     r"(?:e_proj|h_proj)"
     r")\.weight$"
+)
+
+_DSPARK_COMMON_TENSOR_SUFFIXES = (
+    "attn.attn_sink",
+    "attn.q_norm.weight",
+    "attn.kv_norm.weight",
+    "attn_norm.weight",
+    "ffn_norm.weight",
+    "ffn.gate.weight",
+    "ffn.gate.bias",
+    "hc_attn_base",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+)
+_DSPARK_SCALED_MODULE_SUFFIXES = (
+    "attn.wq_a",
+    "attn.wq_b",
+    "attn.wkv",
+    "attn.wo_a",
+    "attn.wo_b",
+    "ffn.shared_experts.w1",
+    "ffn.shared_experts.w2",
+    "ffn.shared_experts.w3",
+)
+_DSPARK_FIRST_LAYER_TENSOR_SUFFIXES = (
+    "main_norm.weight",
+    "main_proj.weight",
+    "main_proj.scale",
+)
+_DSPARK_FINAL_LAYER_TENSOR_SUFFIXES = (
+    "confidence_head.proj.weight",
+    "markov_head.markov_w1.weight",
+    "markov_head.markov_w2.weight",
+    "norm.weight",
+    "hc_head_base",
+    "hc_head_fn",
+    "hc_head_scale",
 )
 
 _MXFP4_VALUES = torch.tensor(
@@ -113,6 +157,43 @@ def _safe_shard_path(root: Path, filename: str) -> Path:
     return root / relative_path
 
 
+def _mtp_layer_count(config: Mapping[str, object]) -> int:
+    target_layer_ids = config.get("dspark_target_layer_ids")
+    if target_layer_ids is None:
+        return 1
+    num_layers = int(config.get("num_hidden_layers", 0))
+    if (
+        not isinstance(target_layer_ids, list)
+        or not target_layer_ids
+        or not all(isinstance(layer_id, int) for layer_id in target_layer_ids)
+        or len(set(target_layer_ids)) != len(target_layer_ids)
+        or any(layer_id < 0 or layer_id >= num_layers for layer_id in target_layer_ids)
+    ):
+        raise ValueError("config.json has invalid dspark_target_layer_ids")
+    return len(target_layer_ids)
+
+
+def _required_dspark_tensor_names(
+    mtp_layer_count: int, n_routed_experts: int
+) -> set[str]:
+    required: set[str] = set()
+    for layer_id in range(mtp_layer_count):
+        prefix = f"mtp.{layer_id}"
+        suffixes = set(_DSPARK_COMMON_TENSOR_SUFFIXES)
+        for module_suffix in _DSPARK_SCALED_MODULE_SUFFIXES:
+            suffixes.update((f"{module_suffix}.weight", f"{module_suffix}.scale"))
+        for expert_id in range(n_routed_experts):
+            for weight_id in (1, 2, 3):
+                module_suffix = f"ffn.experts.{expert_id}.w{weight_id}"
+                suffixes.update((f"{module_suffix}.weight", f"{module_suffix}.scale"))
+        if layer_id == 0:
+            suffixes.update(_DSPARK_FIRST_LAYER_TENSOR_SUFFIXES)
+        if layer_id == mtp_layer_count - 1:
+            suffixes.update(_DSPARK_FINAL_LAYER_TENSOR_SUFFIXES)
+        required.update(f"{prefix}.{suffix}" for suffix in suffixes)
+    return required
+
+
 def _validate_source(input_dir: Path) -> tuple[dict, dict[str, str]]:
     config = _read_json(input_dir / "config.json")
     model_type = str(config.get("model_type", "")).lower()
@@ -129,9 +210,17 @@ def _validate_source(input_dir: Path) -> tuple[dict, dict[str, str]]:
 
     num_layers = int(config.get("num_hidden_layers", 0))
     compress_ratios = config.get("compress_ratios")
-    if num_layers <= 0 or not isinstance(compress_ratios, list) or len(compress_ratios) < num_layers:
+    if num_layers <= 0 or not isinstance(compress_ratios, list):
         raise ValueError("config.json has an invalid num_hidden_layers/compress_ratios contract")
-    if int(config.get("n_routed_experts", 0)) <= 0:
+    mtp_layer_count = _mtp_layer_count(config)
+    expected_ratio_count = num_layers + mtp_layer_count
+    if len(compress_ratios) != expected_ratio_count:
+        raise ValueError(
+            "config.json compress_ratios must include one entry per hidden layer and "
+            f"MTP/DSpark layer: expected {expected_ratio_count}, got {len(compress_ratios)}"
+        )
+    n_routed_experts = int(config.get("n_routed_experts", 0))
+    if n_routed_experts <= 0:
         raise ValueError("config.json has an invalid n_routed_experts value")
 
     index = _read_json(input_dir / "model.safetensors.index.json")
@@ -145,11 +234,24 @@ def _validate_source(input_dir: Path) -> tuple[dict, dict[str, str]]:
     if missing_shards:
         raise ValueError(f"missing source shard: {shard_paths[missing_shards[0]]}")
     compress_ratios = tuple(int(value) for value in compress_ratios)
+    missing_dspark_tensors = (
+        sorted(
+            _required_dspark_tensor_names(mtp_layer_count, n_routed_experts)
+            - normalized_map.keys()
+        )
+        if config.get("dspark_target_layer_ids") is not None
+        else []
+    )
+    if missing_dspark_tensors:
+        raise ValueError(
+            "checkpoint is missing required MTP/DSpark tensor: "
+            f"{missing_dspark_tensors[0]}"
+        )
     missing_scales = sorted(
         name
         for name in normalized_map
         if name.endswith(".weight")
-        and _is_serving_quantized_weight(name, compress_ratios)
+        and _is_serving_quantized_weight(name, compress_ratios, mtp_layer_count)
         and _source_scale_name(name) not in normalized_map
     )
     if missing_scales:
@@ -157,9 +259,12 @@ def _validate_source(input_dir: Path) -> tuple[dict, dict[str, str]]:
     return config, normalized_map
 
 
-def _is_serving_quantized_weight(name: str, compress_ratios: Sequence[int]) -> bool:
-    if _MTP_QUANT_RE.fullmatch(name):
-        return True
+def _is_serving_quantized_weight(
+    name: str, compress_ratios: Sequence[int], mtp_layer_count: int = 1
+) -> bool:
+    mtp_match = _MTP_QUANT_RE.fullmatch(name)
+    if mtp_match:
+        return int(mtp_match.group("mtp_layer")) < mtp_layer_count
     match = _LAYER_QUANT_RE.fullmatch(name)
     if match is None:
         return False
@@ -235,6 +340,7 @@ def _quantize_weight_per_output(weight: torch.Tensor) -> tuple[torch.Tensor, tor
 def _build_output_weight_map(
     source_map: Mapping[str, str],
     compress_ratios: Sequence[int],
+    mtp_layer_count: int = 1,
 ) -> dict[str, str]:
     output_map: dict[str, str] = {}
     for name, filename in source_map.items():
@@ -244,13 +350,15 @@ def _build_output_weight_map(
         if (
             name.endswith(".weight")
             and _source_scale_name(name) in source_map
-            and _is_serving_quantized_weight(name, compress_ratios)
+            and _is_serving_quantized_weight(name, compress_ratios, mtp_layer_count)
         ):
             output_map[_source_scale_name(name)] = filename
     return output_map
 
 
-def _quantization_ignore(num_layers: int, compress_ratios: Sequence[int]) -> list[str]:
+def _quantization_ignore(
+    num_layers: int, compress_ratios: Sequence[int], mtp_layer_count: int = 1
+) -> list[str]:
     """Build compressed-tensors metadata matching the converted tensor policy."""
     ignore: list[str] = []
     for layer_id in range(num_layers):
@@ -269,11 +377,32 @@ def _quantization_ignore(num_layers: int, compress_ratios: Sequence[int]) -> lis
             )
         elif ratio == 128:
             ignore.extend((f"{prefix}.compressor.wgate", f"{prefix}.compressor.wkv"))
-    ignore.extend(("mtp.0.attn.wq_a", "mtp.0.attn.wkv", "mtp.0.attn.wo_a", "mtp.0.head", "head"))
+    for mtp_layer in range(mtp_layer_count):
+        prefix = f"mtp.{mtp_layer}"
+        ignore.extend(
+            (
+                f"{prefix}.attn.wq_a",
+                f"{prefix}.attn.wkv",
+                f"{prefix}.attn.wo_a",
+                f"{prefix}.head",
+            )
+        )
+    if mtp_layer_count > 1:
+        ignore.extend(
+            (
+                "mtp.0.main_proj",
+                f"mtp.{mtp_layer_count - 1}.markov_head.markov_w1",
+                f"mtp.{mtp_layer_count - 1}.markov_head.markov_w2",
+                f"mtp.{mtp_layer_count - 1}.confidence_head.proj",
+            )
+        )
+    ignore.append("head")
     return ignore
 
 
-def _serving_quantization_config(num_layers: int, compress_ratios: Sequence[int]) -> dict:
+def _serving_quantization_config(
+    num_layers: int, compress_ratios: Sequence[int], mtp_layer_count: int = 1
+) -> dict:
     return {
         "config_groups": {
             "group_0": {
@@ -308,12 +437,32 @@ def _serving_quantization_config(num_layers: int, compress_ratios: Sequence[int]
         },
         "format": "int-quantized",
         "global_compression_ratio": 1,
-        "ignore": _quantization_ignore(num_layers, compress_ratios),
+        "ignore": _quantization_ignore(num_layers, compress_ratios, mtp_layer_count),
         "quant_method": "compressed-tensors",
         "quantization_status": "compressed",
         "kv_cache_scheme": None,
         "li_cache_scheme": {"type": "int", "num_bits": 8},
     }
+
+
+def _build_output_config(
+    config: Mapping[str, object],
+    compress_ratios: Sequence[int],
+    mtp_layer_count: int,
+    *,
+    no_spec_compatible: bool,
+) -> dict:
+    num_layers = int(config["num_hidden_layers"])
+    output_ratios = tuple(int(value) for value in compress_ratios)
+    if no_spec_compatible:
+        output_ratios = output_ratios[: num_layers + 1]
+
+    output_config = dict(config)
+    output_config["compress_ratios"] = list(output_ratios)
+    output_config["quantization_config"] = _serving_quantization_config(
+        num_layers, compress_ratios, mtp_layer_count
+    )
+    return output_config
 
 
 def _load_scale(
@@ -323,16 +472,64 @@ def _load_scale(
     current_tensors: Mapping[str, torch.Tensor],
     scale_name: str,
 ) -> torch.Tensor:
-    assert safe_open is not None
     scale_filename = source_map.get(scale_name)
     if scale_filename is None:
         raise ValueError(f"missing source scale for quantized weight: {scale_name}")
-    if scale_filename == current_filename:
-        return current_tensors[scale_name]
-    with safe_open(
-        str(_safe_shard_path(input_dir, scale_filename)), framework="pt", device="cpu"
-    ) as reader:
-        return reader.get_tensor(scale_name)
+    return _load_e8m0_scale(_safe_shard_path(input_dir, scale_filename), scale_name)
+
+
+def _load_e8m0_scale(path: Path, name: str) -> torch.Tensor:
+    """Load an F8_E8M0 tensor on Torch versions without that dtype."""
+    with path.open("rb") as file:
+        header_size_bytes = file.read(8)
+        if len(header_size_bytes) != 8:
+            raise ValueError(f"invalid safetensors header in {path}")
+        header_size = int.from_bytes(header_size_bytes, byteorder="little", signed=False)
+        try:
+            header = json.loads(file.read(header_size))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid safetensors header JSON in {path}: {exc}") from exc
+        metadata = header.get(name) if isinstance(header, dict) else None
+        if not isinstance(metadata, dict) or metadata.get("dtype") != "F8_E8M0":
+            raise ValueError(f"missing F8_E8M0 tensor {name!r} in {path}")
+        shape = metadata.get("shape")
+        offsets = metadata.get("data_offsets")
+        if (
+            not isinstance(shape, list)
+            or not all(isinstance(size, int) and size >= 0 for size in shape)
+            or not isinstance(offsets, list)
+            or len(offsets) != 2
+            or not all(isinstance(offset, int) for offset in offsets)
+        ):
+            raise ValueError(f"invalid F8_E8M0 tensor metadata for {name!r} in {path}")
+        element_count = 1
+        for size in shape:
+            element_count *= size
+        if offsets[0] < 0 or offsets[1] - offsets[0] != element_count:
+            raise ValueError(f"invalid F8_E8M0 data offsets for {name!r} in {path}")
+        file.seek(8 + header_size + offsets[0])
+        payload = file.read(element_count)
+    if len(payload) != element_count:
+        raise ValueError(f"truncated F8_E8M0 tensor {name!r} in {path}")
+    encoded = torch.frombuffer(bytearray(payload), dtype=torch.uint8).clone()
+    if torch.any(encoded == 0xFF):
+        raise ValueError(f"F8_E8M0 tensor {name!r} in {path} contains NaN")
+    scale = torch.ldexp(torch.ones(element_count, dtype=torch.float32), encoded.int() - 127)
+    return scale.reshape(shape)
+
+
+def _load_shard_tensors(
+    path: Path, source_map: Mapping[str, str]
+) -> dict[str, torch.Tensor]:
+    """Load a shard without asking Torch to materialize F8_E8M0 scales."""
+    assert safe_open is not None
+    tensors: dict[str, torch.Tensor] = {}
+    with safe_open(str(path), framework="pt", device="cpu") as reader:
+        for name in reader.keys():
+            if name.endswith(".scale") and _source_weight_name(name) in source_map:
+                continue
+            tensors[name] = reader.get_tensor(name)
+    return tensors
 
 
 def _read_tensor_specs(path: Path) -> dict[str, TensorSpec]:
@@ -353,6 +550,7 @@ def _expected_output_specs(
     source_map: Mapping[str, str],
     output_map: Mapping[str, str],
     compress_ratios: Sequence[int],
+    mtp_layer_count: int = 1,
 ) -> dict[str, dict[str, TensorSpec]]:
     source_specs: dict[str, TensorSpec] = {}
     for filename in set(source_map.values()):
@@ -398,7 +596,11 @@ def _expected_output_specs(
         if name.endswith(".scale") and weight_name in dequantized_shapes:
             spec = ("F32", (dequantized_shapes[weight_name][0],))
         elif name in dequantized_shapes:
-            dtype = "I8" if _is_serving_quantized_weight(name, compress_ratios) else "BF16"
+            dtype = (
+                "I8"
+                if _is_serving_quantized_weight(name, compress_ratios, mtp_layer_count)
+                else "BF16"
+            )
             spec = (dtype, dequantized_shapes[name])
         else:
             spec = source_specs[name]
@@ -426,12 +628,12 @@ def _convert_shard(
     filename: str,
     source_map: Mapping[str, str],
     compress_ratios: Sequence[int],
+    mtp_layer_count: int = 1,
 ) -> None:
-    assert load_file is not None
     assert save_file is not None
     source_path = _safe_shard_path(input_dir, filename)
     output_path = _safe_shard_path(output_dir, filename)
-    source_tensors = load_file(str(source_path), device="cpu")
+    source_tensors = _load_shard_tensors(source_path, source_map)
     converted: dict[str, torch.Tensor] = {}
 
     for name, tensor in source_tensors.items():
@@ -444,7 +646,7 @@ def _convert_shard(
 
         source_scale = _load_scale(input_dir, source_map, filename, source_tensors, scale_name)
         dequantized = _dequantize_hybrid_weight(tensor, source_scale)
-        if _is_serving_quantized_weight(name, compress_ratios):
+        if _is_serving_quantized_weight(name, compress_ratios, mtp_layer_count):
             quantized, dequant_scale = _quantize_weight_per_output(dequantized)
             converted[name] = quantized
             converted[scale_name] = dequant_scale
@@ -566,7 +768,14 @@ def _validate_conversion_marker(
     return marker
 
 
-def convert_checkpoint(input_dir: Path, output_dir: Path, *, resume: bool, dry_run: bool) -> None:
+def convert_checkpoint(
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    resume: bool,
+    dry_run: bool,
+    no_spec_compatible: bool = False,
+) -> None:
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
     if input_dir == output_dir:
@@ -575,24 +784,36 @@ def convert_checkpoint(input_dir: Path, output_dir: Path, *, resume: bool, dry_r
     config, source_map = _validate_source(input_dir)
     num_layers = int(config["num_hidden_layers"])
     compress_ratios = tuple(int(value) for value in config["compress_ratios"])
-    output_map = _build_output_weight_map(source_map, compress_ratios)
+    mtp_layer_count = _mtp_layer_count(config)
+    output_config = _build_output_config(
+        config,
+        compress_ratios,
+        mtp_layer_count,
+        no_spec_compatible=no_spec_compatible,
+    )
+    output_map = _build_output_weight_map(source_map, compress_ratios, mtp_layer_count)
     shard_names = sorted(set(source_map.values()))
     _require_safetensors()
-    expected_by_shard = _expected_output_specs(input_dir, source_map, output_map, compress_ratios)
+    expected_by_shard = _expected_output_specs(
+        input_dir, source_map, output_map, compress_ratios, mtp_layer_count
+    )
     selected_count = sum(
-        name.endswith(".weight") and _is_serving_quantized_weight(name, compress_ratios)
+        name.endswith(".weight")
+        and _is_serving_quantized_weight(name, compress_ratios, mtp_layer_count)
         for name in source_map
     )
     dequantized_count = sum(
         name.endswith(".weight")
         and _source_scale_name(name) in source_map
-        and not _is_serving_quantized_weight(name, compress_ratios)
+        and not _is_serving_quantized_weight(name, compress_ratios, mtp_layer_count)
         for name in source_map
     )
 
     print(f"Input:  {input_dir}")
     print(f"Output: {output_dir}")
     print(f"Shards: {len(shard_names)}")
+    print(f"MTP/DSpark layers: {mtp_layer_count}")
+    print(f"Output compress ratios: {len(output_config['compress_ratios'])}")
     print(f"Serving INT8 weights: {selected_count}")
     print(f"BF16 fallback weights: {dequantized_count}")
     if dry_run:
@@ -618,10 +839,10 @@ def convert_checkpoint(input_dir: Path, output_dir: Path, *, resume: bool, dry_r
             print(f"[{shard_index:02d}/{len(shard_names):02d}] resume: {filename}", flush=True)
             continue
         print(f"[{shard_index:02d}/{len(shard_names):02d}] convert: {filename}", flush=True)
-        _convert_shard(input_dir, output_dir, filename, source_map, compress_ratios)
+        _convert_shard(
+            input_dir, output_dir, filename, source_map, compress_ratios, mtp_layer_count
+        )
 
-    output_config = dict(config)
-    output_config["quantization_config"] = _serving_quantization_config(num_layers, compress_ratios)
     (output_dir / "config.json").write_text(json.dumps(output_config, indent=2) + "\n")
     total_size = sum(
         _safetensors_total_size(_safe_shard_path(output_dir, filename)) for filename in shard_names
@@ -657,13 +878,27 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="validate the source and print the conversion plan without writing files",
     )
+    parser.add_argument(
+        "--no-spec-compatible",
+        action="store_true",
+        help=(
+            "write the current serving config contract for use with --no-enable-mtp; "
+            "all configured MTP/DSpark weights are still converted"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        convert_checkpoint(args.input_dir, args.output_dir, resume=args.resume, dry_run=args.dry_run)
+        convert_checkpoint(
+            args.input_dir,
+            args.output_dir,
+            resume=args.resume,
+            dry_run=args.dry_run,
+            no_spec_compatible=args.no_spec_compatible,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
