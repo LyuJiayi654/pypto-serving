@@ -254,10 +254,12 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         else:
             logger.info("[init_kv_cache] committed_device_memory unavailable; using driver-only peak_non_kv sizing")
         num_pages = self._compute_kv_cache_pages(
-            config, runtime, self._device_id, simpler_committed=simpler_committed,
+            config, runtime, self._shared_l3_worker(), simpler_committed=simpler_committed,
         )
         num_pages = self._alloc_kv_cache_with_retry(model_id, config, runtime, num_pages)
-        self._print_memory_breakdown("after KV cache alloc", config, runtime, num_pages, self._device_id)
+        self._print_memory_breakdown(
+            "after KV cache alloc", config, runtime, num_pages, self._shared_l3_worker(),
+        )
         logger.info("[init_kv_cache] done")
         return num_pages
 
@@ -321,7 +323,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
     @staticmethod
     def _compute_kv_cache_pages(
-        config: ModelConfig, runtime: RuntimeConfig, device_id: int = 0, simpler_committed: int = 0,
+        config: ModelConfig, runtime: RuntimeConfig, worker: Any, simpler_committed: int = 0,
     ) -> int:
         """Compute KV cache pages, vLLM-style: total x utilization - peak_non_kv.
 
@@ -334,8 +336,13 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         ``simpler_committed`` (``Worker.committed_device_memory``; 0 if unknown)
         overlap (both include weights + arenas); taking the max never
         over-provisions whether or not the driver sees simpler's ``rtMalloc`` pool.
+
+        The free/total snapshot comes from ``worker.device_memory_info(0)``:
+        logical worker 0 is the chip this runner serves, and the query runs in
+        the worker process that owns the device context (so no torch-npu here).
+        A failed query propagates — substituting zeros would under-size the cache.
         """
-        free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
+        free_bytes, total_bytes = worker.device_memory_info(0)
         dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
         bytes_per_page = (
             config.num_hidden_layers * 2 * config.num_key_value_heads
@@ -363,17 +370,17 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
     @staticmethod
     def _print_memory_breakdown(
         label: str, config: ModelConfig, runtime: RuntimeConfig, num_pages: int,
-        device_id: int = 0,
+        worker: Any,
     ) -> None:
         """Print a per-component NPU memory breakdown at ``label``.
 
-        ``torch.npu.mem_get_info`` only reports a single total, so each part
+        ``worker.device_memory_info`` only reports a single total, so each part
         is reconstructed rather than queried: weights (estimated from the
         model config), KV cache (exact = num_pages x bytes_per_page), simpler
         ring-heap arena (from the dispatch ring config x 4), and the
         residual (compiled buffers + transient activation scratch + overhead).
         """
-        free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
+        free_bytes, total_bytes = worker.device_memory_info(0)
         used_bytes = total_bytes - free_bytes
         dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
 
@@ -441,7 +448,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         )
         logger.info(
             "  note: weights/arena are estimates, KV is exact; total is from "
-            "mem_get_info (may under-count simpler's rtMalloc pool).",
+            "worker.device_memory_info (may under-count simpler's rtMalloc pool).",
         )
 
     def warmup(self, model: RuntimeModel) -> None:
