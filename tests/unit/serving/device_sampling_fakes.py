@@ -18,6 +18,7 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
     SamplingCandidates,
+    SamplingParams,
 )
 from pypto_serving.model.common.executor.executor import ModelExecutor
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -103,7 +104,9 @@ class _ImmediateEosExecutor(ModelExecutor):
         model: RuntimeModel,
         request_ids: list[str],
         sampled_token_ids: list[int],
+        sampling_params: list[SamplingParams] | None = None,
     ) -> None:
+        del sampling_params
         self.finalized_prefills.append((list(request_ids), list(sampled_token_ids)))
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
@@ -120,7 +123,8 @@ class _FailingSampler:
     def from_generate_config(self, config):
         return None
 
-    def sample(self, logits, params) -> int:
+    def sample(self, logits, params, request_id=None) -> int:
+        del request_id
         self.sample_calls += 1
         raise AssertionError("host sampler should not be used when device sampled ids are available")
 
@@ -133,7 +137,8 @@ class _FixedSampler:
     def from_generate_config(self, config):
         return None
 
-    def sample(self, logits, params) -> int:
+    def sample(self, logits, params, request_id=None) -> int:
+        del request_id
         self.sample_calls += 1
         return self.token_id
 
@@ -143,7 +148,8 @@ class _CandidateSampler(_FixedSampler):
         super().__init__(token_id)
         self.candidate_calls = 0
 
-    def sample_from_candidates(self, candidates, row_idx, params) -> int:
+    def sample_from_candidates(self, candidates, row_idx, params, request_id=None) -> int:
+        del request_id
         self.candidate_calls += 1
         return self.token_id
 
@@ -154,7 +160,8 @@ class _RoutingSampler(_FixedSampler):
         self.candidate_token_id = candidate_token_id
         self.candidate_calls = 0
 
-    def sample_from_candidates(self, candidates, row_idx, params) -> int:
+    def sample_from_candidates(self, candidates, row_idx, params, request_id=None) -> int:
+        del request_id
         self.candidate_calls += 1
         return self.candidate_token_id
 

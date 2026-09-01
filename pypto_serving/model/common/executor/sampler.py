@@ -19,7 +19,15 @@ from pypto_serving.config.types import GenerateConfig, SamplingCandidates, Sampl
 class Sampler:
     """Token sampler that supports greedy, top-k, and top-p sampling."""
 
-    def sample(self, logits: torch.Tensor, params: SamplingParams) -> int:
+    def __init__(self) -> None:
+        self._generators: dict[str, tuple[int, str, torch.Generator]] = {}
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        params: SamplingParams,
+        request_id: str | None = None,
+    ) -> int:
         """Sample one token ID from logits using the supplied sampling params."""
         logits = self._sanitize_logits(logits)
         if params.temperature <= 0.0:
@@ -51,11 +59,19 @@ class Sampler:
             if not self._is_valid_distribution(probs):
                 return self._greedy_token(logits)
 
-        token = torch.multinomial(probs, num_samples=1)
+        token = torch.multinomial(
+            probs,
+            num_samples=1,
+            generator=self._generator(probs, params, request_id),
+        )
         return int(token.item())
 
     def sample_from_candidates(
-        self, candidates: SamplingCandidates, row_idx: int, params: SamplingParams
+        self,
+        candidates: SamplingCandidates,
+        row_idx: int,
+        params: SamplingParams,
+        request_id: str | None = None,
     ) -> int:
         """Sample from an executor-provided top-k candidate row."""
         value_rows = candidates.values.shape[0]
@@ -101,8 +117,42 @@ class Sampler:
             if not self._is_valid_distribution(probs):
                 return int(token_ids[self._greedy_token(values)].item())
 
-        sampled_pos = torch.multinomial(probs, num_samples=1)
+        sampled_pos = torch.multinomial(
+            probs,
+            num_samples=1,
+            generator=self._generator(probs, params, request_id),
+        )
         return int(token_ids[int(sampled_pos.item())].item())
+
+    def release_requests(self, request_ids: list[str]) -> None:
+        """Drop deterministic RNG state for completed or aborted requests."""
+        for request_id in request_ids:
+            self._generators.pop(request_id, None)
+
+    def _generator(
+        self,
+        values: torch.Tensor,
+        params: SamplingParams,
+        request_id: str | None,
+    ) -> torch.Generator | None:
+        """Return the deterministic request generator when a seed was supplied."""
+        if params.seed is None:
+            return None
+        if request_id is None:
+            generator = torch.Generator(device=values.device)
+            generator.manual_seed(int(params.seed) & 0x3FFFFFFF)
+            return generator
+        seed = int(params.seed) & 0x3FFFFFFF
+        device = str(values.device)
+        cached = self._generators.get(request_id)
+        if cached is not None:
+            cached_seed, cached_device, generator = cached
+            if cached_seed == seed and cached_device == device:
+                return generator
+        generator = torch.Generator(device=values.device)
+        generator.manual_seed(seed)
+        self._generators[request_id] = (seed, device, generator)
+        return generator
 
     @staticmethod
     def from_generate_config(config: GenerateConfig) -> SamplingParams:
@@ -111,6 +161,7 @@ class Sampler:
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
+            seed=config.seed,
         )
 
     @staticmethod
@@ -131,7 +182,12 @@ class Sampler:
     def _is_valid_distribution(probs: torch.Tensor) -> bool:
         """Return whether probabilities can be sampled safely."""
         total = probs.sum()
-        return bool(torch.isfinite(probs).all() and torch.all(probs >= 0) and torch.isfinite(total) and total.item() > 0.0)
+        return bool(
+            torch.isfinite(probs).all()
+            and torch.all(probs >= 0)
+            and torch.isfinite(total)
+            and total.item() > 0.0
+        )
 
     @staticmethod
     def _greedy_token(logits: torch.Tensor) -> int:
