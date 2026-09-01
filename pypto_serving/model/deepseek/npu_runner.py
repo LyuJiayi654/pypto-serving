@@ -3615,11 +3615,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         pool = self._materialize_mtp_tail_pre_hc_pool(int(staged.shape[-1]))
         shard = pool.shards[rank]
         row_nbytes = staged.numel() * staged.element_size()
-        dst = shard.data_ptr + slot * row_nbytes
         self._shared_l3_worker().copy_to(
-            dst,
+            shard.data_ptr,
             staged.data_ptr(),
             row_nbytes,
+            dst_offset=slot * row_nbytes,
             worker_id=rank,
         )
 
@@ -3657,9 +3657,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             shard = device_tensor.shards[rank]
             row_nbytes = source.numel() * source.element_size()
             worker.copy_to(
-                shard.data_ptr + slot * row_nbytes,
+                shard.data_ptr,
                 source.data_ptr(),
                 row_nbytes,
+                dst_offset=slot * row_nbytes,
                 worker_id=rank,
             )
         state.device_state_initialized = True
@@ -4225,8 +4226,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         row_nbytes = host_row.numel() * host_row.element_size()
         self._shared_l3_worker().copy_from(
             host_row.data_ptr(),
-            shard.data_ptr + row * row_nbytes,
+            shard.data_ptr,
             row_nbytes,
+            src_offset=row * row_nbytes,
             worker_id=worker_id,
         )
         return host_row.detach().cpu().clone()
