@@ -79,6 +79,14 @@ def span_ms(span) -> float:
     return span.dur / 1_000_000.0
 
 
+def span_by_alias(names: dict, *aliases: str):
+    for alias in aliases:
+        span = names.get(alias)
+        if span is not None:
+            return span
+    raise KeyError(f"missing span aliases: {aliases}")
+
+
 def classify_callables(invocations: list) -> tuple[dict[str, str], dict[str, int]]:
     counts = Counter(invocation.hid for invocation in invocations)
     first_ts = {
@@ -202,9 +210,13 @@ def main() -> None:
                     "device": pid_to_device[pid],
                     "source_invocation": invocation.inv,
                     "host_ms": span_ms(root),
-                    "bind_ms": span_ms(names["simpler_run.bind"]),
-                    "runner_run_ms": span_ms(names["simpler_run.runner_run"]),
-                    "validate_ms": span_ms(names["simpler_run.validate"]),
+                    "bind_ms": span_ms(span_by_alias(names, "chip.run.bind", "simpler_run.bind")),
+                    "runner_run_ms": span_ms(
+                        span_by_alias(names, "chip.run.runner_run", "simpler_run.runner_run")
+                    ),
+                    "validate_ms": span_ms(
+                        span_by_alias(names, "chip.run.validate", "simpler_run.validate")
+                    ),
                 }
             )
         decode_rows.append(

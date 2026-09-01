@@ -47,6 +47,24 @@ def one_event(events: list[dict], name: str) -> dict | None:
     return matches[0]
 
 
+def one_event_alias(events: list[dict], *names: str) -> dict | None:
+    for name in names:
+        event = one_event(events, name)
+        if event is not None:
+            return event
+    return None
+
+
+def stage_name(source_name: str) -> str:
+    for root_name in ("chip.run", "simpler_run"):
+        if source_name == root_name:
+            return "simpler_run"
+        prefix = f"{root_name}."
+        if source_name.startswith(prefix):
+            return source_name.removeprefix(prefix)
+    return source_name
+
+
 def sort_number(value: object) -> float:
     try:
         return float(value)  # type: ignore[arg-type]
@@ -102,7 +120,7 @@ def main() -> None:
         event
         for events in grouped.values()
         for event in events
-        if event.get("name") == "simpler_run"
+        if event.get("name") in {"chip.run", "simpler_run"}
     ]
     serving_payload = json.loads(args.serving_trace.read_text(encoding="utf-8"))
     serving_events = serving_payload["traceEvents"]
@@ -172,9 +190,10 @@ def main() -> None:
     sequence_by_pid: dict[int, Counter] = defaultdict(Counter)
     invocation_count = 0
     for virtual_pid, events in sorted(
-        grouped.items(), key=lambda item: float(one_event(item[1], "simpler_run")["ts"])
+        grouped.items(),
+        key=lambda item: float(one_event_alias(item[1], "chip.run", "simpler_run")["ts"]),
     ):
-        root = one_event(events, "simpler_run")
+        root = one_event_alias(events, "chip.run", "simpler_run")
         if root is None:
             continue
         raw_pid, raw_invocation = virtual_processes[virtual_pid]
@@ -191,9 +210,9 @@ def main() -> None:
             if decode_step is not None
             else f"P{sequence:03d} {label}"
         )
-        bind = one_event(events, "simpler_run.bind")
-        runner = one_event(events, "simpler_run.runner_run")
-        validate = one_event(events, "simpler_run.validate")
+        bind = one_event_alias(events, "chip.run.bind", "simpler_run.bind")
+        runner = one_event_alias(events, "chip.run.runner_run", "simpler_run.runner_run")
+        validate = one_event_alias(events, "chip.run.validate", "simpler_run.validate")
         common_args = {
             "device": device,
             "invocation": raw_invocation,
@@ -210,8 +229,7 @@ def main() -> None:
             if source_event.get("ph") != "X":
                 continue
             source_name = str(source_event.get("name", ""))
-            stage = source_name.removeprefix("simpler_run").removeprefix(".")
-            stage = stage or "simpler_run"
+            stage = stage_name(source_name)
             output_events.append(
                 {
                     "ph": "X",

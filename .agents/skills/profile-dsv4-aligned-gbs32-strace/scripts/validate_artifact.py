@@ -51,7 +51,7 @@ def main() -> None:
         event
         for event in host
         if event.get("args", {}).get("callable") == "decode.main+verify+mtp"
-        and event.get("args", {}).get("strace_name") == "simpler_run"
+        and event.get("args", {}).get("strace_name") in {"chip.run", "simpler_run"}
     ]
     steps = sorted({int(event["args"]["decode_step"]) for event in decode_roots})
     if (
