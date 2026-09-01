@@ -29,7 +29,7 @@ def _write_source_metadata(tmp_path, weight_map, *, create_shards=True):
         "model_type": "deepseek_v4",
         "quantization_config": {"quant_method": "fp8"},
         "num_hidden_layers": 1,
-        "compress_ratios": [0],
+        "compress_ratios": [0, 0],
         "n_routed_experts": 1,
     }
     tmp_path.mkdir(exist_ok=True)
@@ -69,6 +69,33 @@ def test_fp8_dequantization_rejects_other_one_byte_dtypes():
         convert._dequantize_hybrid_weight(weight, scale)
 
 
+def test_load_e8m0_scale_decodes_exponents(tmp_path):
+    header = {
+        "w.scale": {"dtype": "F8_E8M0", "shape": [2, 2], "data_offsets": [0, 4]}
+    }
+    encoded_header = json.dumps(header).encode()
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(
+        len(encoded_header).to_bytes(8, "little")
+        + encoded_header
+        + bytes([127, 128, 126, 129])
+    )
+
+    actual = convert._load_e8m0_scale(checkpoint, "w.scale")
+
+    assert torch.equal(actual, torch.tensor([[1.0, 2.0], [0.5, 4.0]]))
+
+
+def test_load_e8m0_scale_rejects_nan(tmp_path):
+    header = {"w.scale": {"dtype": "F8_E8M0", "shape": [1], "data_offsets": [0, 1]}}
+    encoded_header = json.dumps(header).encode()
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(len(encoded_header).to_bytes(8, "little") + encoded_header + b"\xff")
+
+    with pytest.raises(ValueError, match="contains NaN"):
+        convert._load_e8m0_scale(checkpoint, "w.scale")
+
+
 def test_serving_quantization_is_symmetric_per_output_channel():
     weight = torch.tensor([[0.0, 1.0, -2.0], [0.5, -0.5, 0.25]], dtype=torch.float32)
 
@@ -87,6 +114,103 @@ def test_quantized_weight_selection_matches_deepseek_v4_serving_contract():
     assert convert._is_serving_quantized_weight("mtp.0.e_proj.weight", ratios)
     assert not convert._is_serving_quantized_weight("layers.3.attn.indexer.wq_b.weight", ratios)
     assert not convert._is_serving_quantized_weight("layers.0.attn.wq_a.weight", ratios)
+
+
+def test_quantized_weight_selection_includes_all_dspark_draft_layers():
+    ratios = [0, 0, 4, 128]
+
+    assert convert._is_serving_quantized_weight(
+        "mtp.2.ffn.experts.17.w2.weight", ratios, mtp_layer_count=3
+    )
+    assert convert._is_serving_quantized_weight(
+        "mtp.1.attn.wq_b.weight", ratios, mtp_layer_count=3
+    )
+    assert not convert._is_serving_quantized_weight(
+        "mtp.3.attn.wq_b.weight", ratios, mtp_layer_count=3
+    )
+    assert not convert._is_serving_quantized_weight(
+        "mtp.2.main_proj.weight", ratios, mtp_layer_count=3
+    )
+
+
+def test_mtp_layer_count_uses_dspark_target_layers():
+    assert convert._mtp_layer_count({"num_hidden_layers": 43}) == 1
+    assert (
+        convert._mtp_layer_count(
+            {"num_hidden_layers": 43, "dspark_target_layer_ids": [40, 41, 42]}
+        )
+        == 3
+    )
+
+
+@pytest.mark.parametrize(
+    "target_layer_ids",
+    [[], [40, 40], [-1], [43], ["40"]],
+)
+def test_mtp_layer_count_rejects_invalid_dspark_target_layers(target_layer_ids):
+    with pytest.raises(ValueError, match="invalid dspark_target_layer_ids"):
+        convert._mtp_layer_count(
+            {"num_hidden_layers": 43, "dspark_target_layer_ids": target_layer_ids}
+        )
+
+
+def test_dspark_quantization_metadata_ignores_bf16_projections():
+    ignore = convert._quantization_ignore(43, [0] * 43, mtp_layer_count=3)
+
+    assert "mtp.1.attn.wq_a" in ignore
+    assert "mtp.2.attn.wkv" in ignore
+    assert "mtp.0.main_proj" in ignore
+    assert "mtp.2.markov_head.markov_w1" in ignore
+    assert "mtp.2.markov_head.markov_w2" in ignore
+    assert "mtp.2.confidence_head.proj" in ignore
+
+
+def test_output_config_keeps_all_dspark_ratios_by_default():
+    source_config = {
+        "num_hidden_layers": 43,
+        "compress_ratios": [0] * 46,
+    }
+
+    output_config = convert._build_output_config(
+        source_config,
+        source_config["compress_ratios"],
+        mtp_layer_count=3,
+        no_spec_compatible=False,
+    )
+
+    assert len(output_config["compress_ratios"]) == 46
+
+
+def test_no_spec_output_config_matches_current_serving_loader_contract():
+    from pypto_serving.model.model_loader import _validate_deepseek_v4_weight_index
+
+    source_config = {
+        "num_hidden_layers": 43,
+        "compress_ratios": [0] * 46,
+    }
+    output_config = convert._build_output_config(
+        source_config,
+        source_config["compress_ratios"],
+        mtp_layer_count=3,
+        no_spec_compatible=True,
+    )
+    required_weights = {
+        name: "model.safetensors"
+        for name in (
+            "embed.weight",
+            "norm.weight",
+            "head.weight",
+            "layers.0.attn.wq_b.weight",
+            "layers.0.attn.wq_b.scale",
+            "layers.0.attn.wo_b.weight",
+            "layers.0.attn.wo_b.scale",
+            "layers.0.ffn.experts.0.w1.weight",
+            "layers.0.ffn.experts.0.w1.scale",
+        )
+    }
+
+    assert len(output_config["compress_ratios"]) == 44
+    _validate_deepseek_v4_weight_index(required_weights, output_config)
 
 
 def test_output_weight_map_only_adds_scales_available_in_the_source():
@@ -114,6 +238,47 @@ def test_source_validation_rejects_a_selected_weight_without_scale(tmp_path):
 
     with pytest.raises(ValueError, match="missing source scale for serving-quantized weight"):
         convert._validate_source(tmp_path)
+
+
+def test_source_validation_requires_exact_dspark_compress_ratio_count(tmp_path):
+    shard_name = "model-1.safetensors"
+    _write_source_metadata(tmp_path, {"embed.weight": shard_name})
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["num_hidden_layers"] = 2
+    config["compress_ratios"] = [0, 0]
+    config["dspark_target_layer_ids"] = [0]
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="expected 3, got 2"):
+        convert._validate_source(tmp_path)
+
+
+def test_source_validation_rejects_an_incomplete_dspark_layer(tmp_path):
+    shard_name = "model-1.safetensors"
+    required_names = convert._required_dspark_tensor_names(
+        mtp_layer_count=1, n_routed_experts=1
+    )
+    assert len(required_names) == 45
+    assert "mtp.0.main_proj.weight" in required_names
+    assert "mtp.0.markov_head.markov_w2.weight" in required_names
+    missing_name = "mtp.0.ffn.experts.0.w2.weight"
+    weight_map = {name: shard_name for name in required_names - {missing_name}}
+    _write_source_metadata(tmp_path, weight_map)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["num_hidden_layers"] = 2
+    config["compress_ratios"] = [0, 0, 0]
+    config["dspark_target_layer_ids"] = [0]
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match=missing_name):
+        convert._validate_source(tmp_path)
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard_name for name in required_names}})
+    )
+    convert._validate_source(tmp_path)
 
 
 @pytest.mark.parametrize("shard_name", ["..", "../escaped.safetensors", "/tmp/escaped.safetensors"])
@@ -182,6 +347,14 @@ def test_auxiliary_files_are_copied_atomically(tmp_path):
 def test_input_and_output_directories_are_required():
     with pytest.raises(SystemExit):
         convert._parse_args([])
+
+
+def test_no_spec_compatible_cli_option_is_explicit():
+    args = convert._parse_args(
+        ["--input-dir", "input", "--output-dir", "output", "--no-spec-compatible"]
+    )
+
+    assert args.no_spec_compatible is True
 
 
 def test_safetensors_total_size_sums_tensor_data_offsets(tmp_path):
