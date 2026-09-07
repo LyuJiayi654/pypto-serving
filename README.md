@@ -9,6 +9,8 @@ The external documentation lives under [`docs/`](docs/index.md). Start with:
 - [Installation](docs/get-started/installation.md)
 - [Quickstart](docs/get-started/quickstart.md)
 - [Online Serving](docs/user-guide/online-serving.md)
+- [vLLM Compatibility](docs/user-guide/vllm-compatibility.md)
+- [Configuration](docs/configuration/index.md)
 - [CLI Reference](docs/cli-reference/index.md)
 - [DeepSeek V4](docs/user-guide/deepseek-v4.md)
 

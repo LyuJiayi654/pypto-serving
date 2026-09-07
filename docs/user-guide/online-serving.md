@@ -1,6 +1,6 @@
 # Online Serving
 
-Online serving starts `pypto-serving`, loads the model in worker processes, and exposes an OpenAI-compatible HTTP API subset.
+Online serving starts `pypto-serving`, loads the model in worker processes, and exposes an OpenAI-compatible HTTP API subset. For the exact vLLM-compatible surface, see [vLLM Compatibility](vllm-compatibility.md).
 
 ## Start a Qwen Server
 
@@ -42,7 +42,7 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/completions \
   -d '{"prompt":"Huawei is","max_tokens":32,"temperature":0.0}'
 ```
 
-Completions accept `model`, `prompt`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, and `stream`.
+Completions accept `model`, `prompt`, `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, and `stream`.
 
 ## Chat Request
 
@@ -52,9 +52,11 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":32}'
 ```
 
-Chat completions accept `model`, `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `stream`, and `chat_template_kwargs`.
+Chat completions accept `model`, `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `stream`, `reasoning_effort`, and `chat_template_kwargs`.
 
 The server converts chat messages to a prompt with the tokenizer's `apply_chat_template` method. `chat_template_kwargs` is forwarded to the tokenizer, which allows model-specific controls such as Qwen thinking-mode settings when the tokenizer supports them.
+
+`reasoning_effort` is forwarded to model-specific chat templating for models that use it. DeepSeek V4 maps it to the model's thinking prompt controls; an explicit `chat_template_kwargs` value can override the derived template setting.
 
 ## Streaming
 
@@ -74,7 +76,7 @@ data: [DONE]
 
 Accumulate `choices[0].text` for completions and `choices[0].delta.content` for chat completions. The final usage event has an empty `choices` list and authoritative token counts.
 
-## Responses
+## Response Schema
 
 Non-streaming responses include one choice and usage counts when the request finishes. Finish reasons are normalized to:
 
@@ -90,6 +92,8 @@ Scheduler and engine rejections are returned as HTTP 400 with:
 ```json
 {"object":"error","message":"..."}
 ```
+
+PyPTO Serving does not expose the OpenAI Responses API at `/v1/responses`; this section describes the JSON response objects returned by the supported completion endpoints.
 
 ## Shutdown
 

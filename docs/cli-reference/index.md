@@ -21,5 +21,7 @@ Use the CLI reference for argument meanings and defaults. Use the workflow guide
 
 - [Offline Inference](../user-guide/offline-inference.md)
 - [Online Serving](../user-guide/online-serving.md)
+- [vLLM Compatibility](../user-guide/vllm-compatibility.md)
+- [Configuration](../configuration/index.md)
 - [Parallelism and Scaling](../user-guide/parallel.md)
 - [Profiling](../user-guide/profile.md)

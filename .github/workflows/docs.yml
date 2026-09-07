@@ -54,6 +54,9 @@ jobs:
       - name: Check public docs boundaries
         run: python tests/lint/check_public_docs.py
 
+      - name: Check API docs coverage
+        run: python tests/lint/check_docs_api_reference.py
+
       - name: Build site
         env:
           # Ref that docs/_hooks/repo_links.py points repo links at. On a pull

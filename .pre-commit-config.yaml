@@ -30,6 +30,13 @@ repos:
         language_version: python3
         pass_filenames: false
 
+      - id: check-docs-api-reference
+        name: check-docs-api-reference
+        entry: python tests/lint/check_docs_api_reference.py
+        language: python
+        language_version: python3
+        pass_filenames: false
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.8
     hooks:

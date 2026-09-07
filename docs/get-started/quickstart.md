@@ -60,6 +60,8 @@ The completion response includes one choice and usage counts when the request fi
 
 - [Offline Inference](../user-guide/offline-inference.md): run larger offline validation workloads.
 - [Online Serving](../user-guide/online-serving.md): configure the HTTP server.
+- [vLLM Compatibility](../user-guide/vllm-compatibility.md): check supported endpoints and request fields before reusing a vLLM client.
+- [Configuration](../configuration/index.md): understand configuration precedence, runtime capacity, and environment variables.
 - [CLI Reference](../cli-reference/index.md): understand CLI arguments and runtime environment variables.
 - [Parallelism and Scaling](../user-guide/parallel.md): configure DP, TP, and DeepSeek V4 overlapped DP/EP.
 - [Profiling](../user-guide/profile.md): capture Chrome trace profiles.

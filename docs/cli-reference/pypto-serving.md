@@ -101,6 +101,7 @@ Server defaults and offline generate mode use `--generate-config`. HTTP request 
 | `temperature` | Sampling temperature. |
 | `top_p` | Nucleus sampling cutoff. |
 | `top_k` | Top-k sampling cutoff. |
+| `seed` | Sampling seed when the model path uses seeded sampling. |
 | `stop` | Stop strings. |
 | `stream` | Stream text deltas. |
 | `ignore_eos` | Generate-mode EOS handling. |

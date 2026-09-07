@@ -19,10 +19,14 @@ The project is intentionally focused. The current external surface is for Qwen3-
 - [Installation](get-started/installation.md): clone, initialize submodules, prepare the runtime, install, and verify the CLI.
 - [Quickstart](get-started/quickstart.md): run Qwen3-14B offline and start the HTTP server.
 - [Online Serving](user-guide/online-serving.md): use the HTTP API subset.
+- [vLLM Compatibility](user-guide/vllm-compatibility.md): check endpoint, request-field, and client compatibility.
+- [Configuration](configuration/index.md): understand runtime capacity, environment variables, and configuration precedence.
 - [CLI Reference](cli-reference/index.md): understand command-line arguments and runtime environment variables.
 
 ## Documentation Map
 
 - **User Guide** explains how to install, run offline inference, serve HTTP traffic, scale across devices, benchmark, profile, and tune runtime behavior.
+- **Configuration** documents runtime capacity, placement, cache, profiling, and environment controls.
+- **Deployment** explains local Ascend validation, long-running server startup, and operational troubleshooting.
 - **CLI Reference** documents installed commands, repository utilities, command-line arguments, and runtime environment variables.
 - **Developer Guide** explains the serving architecture, model integration, runtime internals, and contribution workflow.

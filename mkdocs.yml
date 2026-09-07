@@ -118,12 +118,21 @@ nav:
       - Inference and Serving:
           - Offline Inference: user-guide/offline-inference.md
           - Online Serving: user-guide/online-serving.md
+          - vLLM Compatibility: user-guide/vllm-compatibility.md
           - Parallelism and Scaling: user-guide/parallel.md
           - Benchmarking: user-guide/benchmarking.md
           - Profiling: user-guide/profile.md
       - Models:
+          - Model Support Matrix: user-guide/model-support.md
           - Qwen3-14B: user-guide/qwen.md
           - DeepSeek V4: user-guide/deepseek-v4.md
+  - Configuration:
+      - Overview: configuration/index.md
+      - Runtime Capacity: configuration/runtime-capacity.md
+      - Environment Variables: configuration/env-vars.md
+  - Deployment:
+      - Local Ascend Runs: deployment/local-ascend.md
+      - Troubleshooting: user-guide/troubleshooting.md
   - CLI Reference:
       - Overview: cli-reference/index.md
       - pypto-serving: cli-reference/pypto-serving.md

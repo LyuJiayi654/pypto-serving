@@ -63,6 +63,24 @@ Drive load with a repeatable HTTP client that records request rate or concurrenc
 
 Keep workload inputs explicit. Small changes in prompt length, output length, sampling settings, stream mode, chunked prefill, MTP, or `--max-num-seqs` can change results materially.
 
+## vLLM Benchmark Clients
+
+vLLM benchmark clients can drive PyPTO Serving only when they use the supported
+OpenAI-compatible endpoints and fields. Use workloads that post to
+`/v1/completions` or `/v1/chat/completions`, keep prompts and chat messages as
+strings, and avoid vLLM-only request parameters such as logprobs, beam search,
+structured outputs, tools, prompt embeddings, multimodal inputs, and Responses
+API session fields.
+
+Streaming benchmarks can read token counts from the terminal usage chunk emitted
+before `data: [DONE]`. This matches vLLM-style parsers that use
+`usage.completion_tokens` for throughput accounting.
+
+Treat PyPTO Serving capacity flags as the source of truth. vLLM engine arguments
+are not accepted unless an equivalent appears in
+[Runtime Capacity](../configuration/runtime-capacity.md) or the
+[`pypto-serving`](../cli-reference/pypto-serving.md) reference.
+
 ## Profile a Benchmark Window
 
 Launch with profiling enabled:
