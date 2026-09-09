@@ -114,7 +114,7 @@ async def run(args: argparse.Namespace) -> None:
         "--max-model-len", "512",
         "--max-num-seqs", "32",
         "--max-num-batched-tokens", "2048",
-        "--long-prefill-token-threshold", "128",
+        "--long-prefill-token-threshold", "1024",
         "--ring-heap", "1073741824",
         "--ring-task-window", "131072",
         "--ring-dep-pool", "131072",
