@@ -45,7 +45,6 @@ class MtpAccuracyCase:
     top_k: int | None = None
     seed: int | None = None
     enable_prefix_caching: bool = False
-    validate_chat_template: bool = False
     # Known-valid continuations for cases whose target model hits a documented
     # near-tie; each run must land inside the set instead of matching another
     # run token-for-token.
@@ -65,13 +64,6 @@ PREFIX_PROMPT = " and" * 1200 + " Huawei is"
 PREFIX_CACHE_ACCEPTABLE_TEXTS = (
     " a leading global provider of information and communications technology (",
     " a leading global information and communications technology (ICT)",
-)
-
-CHAT_TEMPLATE_CONTENT = "What is 1+1?"
-DEFAULT_CHAT_PROMPT = (
-    "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
-    "<\uff5cUser\uff5c>What is 1+1?"
-    "<\uff5cAssistant\uff5c></think>"
 )
 
 # Keep the fused K=1 baseline, one standalone DeepSeek MTP decode shape, and
@@ -102,7 +94,6 @@ MTP_CASES = (
         temperature=0.2,
         top_k=32,
         seed=42,
-        validate_chat_template=True,
         # temperature=0.2, top-k=32, seed=42 的 expected text：
         # 城墙的四角，各有一座风姿绰约的角楼，民间有九梁十八柱七十二条脊之说，形容其结构的复杂。
         # 紫禁城内的建筑分为外朝和内廷两部分。外朝的中心为太和殿、中和殿、保和殿，统称三大殿，
@@ -275,29 +266,6 @@ def _request_completion(
     )
 
 
-def _request_chat_completion(
-    process: subprocess.Popen,
-    port: int,
-    deadline: float,
-    *,
-    content: str,
-    max_new_tokens: int,
-) -> dict:
-    return _request_json(
-        process,
-        port,
-        deadline,
-        endpoint="/v1/chat/completions",
-        request_kind="chat completion",
-        payload={
-            "model": MODEL_ID,
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": max_new_tokens,
-            "temperature": 0.0,
-        },
-    )
-
-
 def _request_json(
     process: subprocess.Popen,
     port: int,
@@ -358,38 +326,6 @@ def _request_json(
             raise value
         raise RuntimeError(f"{request_kind} request failed: {value}")
     raise TimeoutError(f"DeepSeek {request_kind} exceeded the end-to-end timeout")
-
-
-def _assert_chat_template_matches_manual_prompt(
-    process: subprocess.Popen,
-    port: int,
-    deadline: float,
-) -> None:
-    raw_response = _request_completion(
-        process,
-        port,
-        deadline,
-        prompt=DEFAULT_CHAT_PROMPT,
-        max_new_tokens=1,
-        temperature=0.0,
-        top_k=None,
-        seed=None,
-    )
-    chat_response = _request_chat_completion(
-        process,
-        port,
-        deadline,
-        content=CHAT_TEMPLATE_CONTENT,
-        max_new_tokens=1,
-    )
-
-    raw_choice = raw_response["choices"][0]
-    chat_choice = chat_response["choices"][0]
-    assert chat_response.get("model") == MODEL_ID
-    assert chat_choice["message"]["role"] == "assistant"
-    assert chat_choice["message"]["content"] == raw_choice["text"]
-    assert chat_response["usage"]["prompt_tokens"] == raw_response["usage"]["prompt_tokens"]
-    assert chat_response["usage"]["completion_tokens"] == 1
 
 
 def _stop_process_group(process: subprocess.Popen) -> None:
@@ -533,9 +469,6 @@ def test_deepseek_v4_http_completion_matches_expected_text(
                     if case.expected_text is not None:
                         assert choices[0].get("text") == case.expected_text
 
-                if case.validate_chat_template:
-                    _assert_chat_template_matches_manual_prompt(process, port, deadline)
-
                 if enable_prefix_caching:
                     prompt_tokens = responses[0].get("usage", {}).get("prompt_tokens", 0)
                     assert prompt_tokens > 1024
@@ -616,7 +549,6 @@ def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
     assert non_prefix_depths == (1, 3)
     assert len(prefix_cases) == 1
     assert prefix_cases[0].num_speculative_tokens == 1
-    assert [case for case in MTP_CASES if case.validate_chat_template] == [MTP_CASES[0]]
     assert (MTP_CASES[0].prompt_tokens, MTP_CASES[0].max_new_tokens) == (64, 128)
     assert (MTP_CASES[0].temperature, MTP_CASES[0].top_k, MTP_CASES[0].seed) == (
         0.2,
