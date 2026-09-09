@@ -19,6 +19,7 @@ env/
 
 # MkDocs build output
 site/
+.site-theme/
 
 # PyPTO/CANN generated artifacts
 build_output/

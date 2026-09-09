@@ -3,6 +3,9 @@
 #
 # Kept alongside the docs rather than as a pyproject extra so CI installs it with
 # a plain `pip install -r`, matching pypto's docs job.
+# The shared theme supplies the tested MkDocs/Material versions.
+-c ../.site-theme/docs-theme/constraints.txt
+
 mkdocs>=1.6
 mkdocs-material>=9.5
 PyYAML>=6,<7
